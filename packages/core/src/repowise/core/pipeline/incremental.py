@@ -50,60 +50,8 @@ def build_filtered_changed_paths(file_diffs: list, exclude_patterns: list[str]) 
     return [p for p in paths if not spec.match_file(p)]
 
 
-def build_repo_graph(
-    repo_path: Any,
-    exclude_patterns: list[str],
-    *,
-    collect_sources: bool = False,
-    include_submodules: bool = False,
-    include_nested_repos: bool = False,
-    log: LogFn | None = None,
-    timings: PhaseTimings | None = None,
-) -> tuple[list, dict[str, bytes], Any, Any, int]:
-    """Traverse + parse the repo and build the graph (+ framework-aware edges).
-
-    Shared by the incremental rebuild path (:func:`rebuild_graph_and_git`) and
-    the config-triggered re-score path so both build the same graph from the
-    same parser and the same synthetic edge step.
-
-    Files that fail to read/parse are skipped and reported as a count rather than
-    swallowed silently. ``source_map`` is populated only when ``collect_sources``
-    is set (the re-score path doesn't need the raw bytes).
-
-    ``timings`` is the run's shared :class:`PhaseTimings` table; each step
-    below records into it under a ``rebuild.*`` name. ``None`` records nothing.
-
-    Returns ``(parsed_files, source_map, graph_builder, repo_structure,
-    file_count)``.
-    """
-    import os
-    from concurrent.futures import ThreadPoolExecutor
-
-    from repowise.core.ingestion import ASTParser, FileTraverser, GraphBuilder
-
-    log = log or _noop_log
-
-    traverser = FileTraverser(
-        repo_path,
-        extra_exclude_patterns=exclude_patterns or None,
-        include_submodules=include_submodules,
-        include_nested_repos=include_nested_repos,
-    )
-    # Parallel stat + header sniffing, mirroring the init ingestion phase.
-    # A serial traverse() pays per-file I/O latency sequentially; on a cold
-    # OS file cache that was ~50s of every PowerToys-scale update. Passing
-    # the file_infos into get_repo_structure also avoids its re-walk.
-    with timed(timings, "rebuild.traverse"):
-        all_paths = list(traverser._walk())
-        io_workers = min(32, max(4, (os.cpu_count() or 4) * 2))
-        with ThreadPoolExecutor(max_workers=io_workers) as io_pool:
-            maybe_infos = list(io_pool.map(traverser._build_file_info, all_paths))
-        file_infos = [fi for fi in maybe_infos if fi is not None]
-        repo_structure = traverser.get_repo_structure(file_infos)
-
-    # Structural episodes, minus the formatter check: this path is the hot one
-    # (every update, plus the config-triggered re-score), so it derives only
-    # what the walk has already paid for and never spawns a subprocess.
+def _record_structural_episodes(repo_path: Any, traverser: Any) -> None:
+    """Best-effort structural episodes from the walk, without the formatter check."""
     try:
         from repowise.core.precedent.structural import record_structural_episodes
 
@@ -111,46 +59,18 @@ def build_repo_graph(
     except Exception:
         pass
 
-    # Thread-pool source reads + content-hash parse cache split, shared with
-    # the init parse phase: only changed files need a tree-sitter parse.
-    # Cache failures degrade to all-miss (full parse), as before.
-    from repowise.core.pipeline.phases.ingestion import (
-        _cache_parsed,
-        _read_sources,
-        _split_cached,
-    )
-    from repowise.core.workspace.update import get_head_commit
 
-    with timed(timings, "rebuild.read"):
-        fi_and_bytes = _read_sources(file_infos, None)
-        parse_cache, cached_hits, to_parse = _split_cached(Path(repo_path), fi_and_bytes, None)
+def _parse_misses(
+    cached_hits: dict[int, Any],
+    to_parse: list,
+    parse_cache: Any,
+    timings: PhaseTimings | None,
+) -> dict[int, Any]:
+    """Parse the parse-cache misses and merge them over the cached hits by index."""
+    from repowise.core.ingestion import ASTParser
+    from repowise.core.pipeline.phases.ingestion import _cache_parsed
 
     parser: Any = None  # constructed lazily — every-file-cached updates skip query compilation
-    parsed_files: list = []
-    source_map: dict[str, bytes] = {}
-    graph_builder = GraphBuilder(
-        repo_path,
-        exclude_patterns=exclude_patterns,
-        centrality_cache_dir=Path(repo_path) / ".repowise",
-        head_commit=get_head_commit(Path(repo_path)),
-        include_submodules=include_submodules,
-        include_nested_repos=include_nested_repos,
-    )
-    # Carry the walk's skip record to the dead-code analyzer. This report is
-    # persisted repo-wide, so an update that could not see the skipped source
-    # files would re-derive and write back the verdicts init had clamped.
-    graph_builder.traversal_stats = traverser.stats
-    # Reconciliation authority is the successful traversal, not the successful
-    # parse set. A transient read/parser failure must not make an existing
-    # in-scope file look deleted and prune its persisted rows.
-    graph_builder.traversed_file_paths = {
-        file_info.path for file_info in file_infos
-    }
-
-    # Parse the misses in process and serially: on the update path they are
-    # change-sized. (Ceiling: a wiped/stale cache re-parses everything on one
-    # core; routing large miss counts through init's process pool would lift
-    # it, at the cost of Windows spawn overhead on every routine update.)
     merged: dict[int, Any] = dict(cached_hits)
     with timed(timings, "rebuild.parse"):
         for idx, (fi, source), content_hash in to_parse:
@@ -163,46 +83,44 @@ def build_repo_graph(
             merged[idx] = parsed
             if content_hash:
                 _cache_parsed(parse_cache, parsed, content_hash)
+    return merged
 
-    skipped = len(file_infos) - len(fi_and_bytes)  # unreadable files
-    # Opened here and closed after build(): graph construction is the add_file
-    # loop plus the resolver, and the tsconfig wiring sits between them.
-    if timings is not None:
-        timings.start("rebuild.graph")
+
+def _add_parsed_files(
+    graph_builder: Any,
+    fi_and_bytes: list,
+    merged: dict[int, Any],
+    collect_sources: bool,
+) -> tuple[list, dict[str, bytes], int]:
+    """Add every parsed file to the graph, in read order.
+
+    Returns ``(parsed_files, source_map, unparsed)``, where ``unparsed`` counts
+    the read files that have no parse result.
+    """
+    parsed_files: list = []
+    source_map: dict[str, bytes] = {}
+    unparsed = 0
     for idx, (fi, source) in enumerate(fi_and_bytes):
         parsed = merged.get(idx)
         if parsed is None:
-            skipped += 1
+            unparsed += 1
             continue
         parsed_files.append(parsed)
         if collect_sources:
             source_map[fi.path] = source
         graph_builder.add_file(parsed)
+    return parsed_files, source_map, unparsed
 
-    # TS/JS path aliases (``@/components/...``) resolve only when the
-    # tsconfig resolver is attached before build(); without it the alias
-    # targets read as external nodes and every aliased file looks
-    # unreachable to the dead-code analyzer (#648 — this rebuild path was
-    # missed when the CLI commands were wired).
-    from repowise.core.ingestion import wire_tsconfig_resolver
 
-    wire_tsconfig_resolver(
-        graph_builder,
-        repo_path,
-        include_submodules=include_submodules,
-        include_nested_repos=include_nested_repos,
-    )
-    graph_builder.set_source_map(source_map)
-    graph_builder.build()
-    if timings is not None:
-        timings.stop("rebuild.graph")
-    if parse_cache is not None:
-        with timed(timings, "rebuild.cache_save"):
-            parse_cache.save()
-
-    if skipped:
-        log(f"[yellow]Skipped {skipped} file(s) that failed to parse.[/yellow]")
-
+def _add_synthetic_edges(
+    repo_path: Any,
+    graph_builder: Any,
+    file_infos: list,
+    source_map: dict[str, bytes],
+    log: LogFn,
+    timings: PhaseTimings | None,
+) -> None:
+    """Add the framework-aware and dynamic-hint edges to a built graph."""
     # Add framework-aware synthetic edges (conftest, Django, FastAPI, Flask).
     # Best-effort, but not silent: the update path has to report the failure the
     # init path reports, or an index degrades differently depending on how it
@@ -234,6 +152,7 @@ def build_repo_graph(
                 Path(repo_path),
                 dotnet_index=graph_builder.dotnet_index,
                 file_paths=[fi.path for fi in file_infos],
+                source_map=source_map or None,
             )
             graph_builder.add_dynamic_edges(dynamic_edges)
         if dynamic_edges:
@@ -245,6 +164,148 @@ def build_repo_graph(
             f"[yellow]Dynamic hint extraction failed: {exc}. Dynamic edges"
             "will be missing from this update.[/yellow]"
         )
+
+
+def build_repo_graph(
+    repo_path: Any,
+    exclude_patterns: list[str],
+    *,
+    collect_sources: bool = False,
+    include_submodules: bool = False,
+    include_nested_repos: bool = False,
+    log: LogFn | None = None,
+    timings: PhaseTimings | None = None,
+    read_only: bool = False,
+) -> tuple[list, dict[str, bytes], Any, Any, int]:
+    """Traverse + parse the repo and build the graph (+ framework-aware edges).
+
+    Shared by the incremental rebuild path (:func:`rebuild_graph_and_git`),
+    the config-triggered re-score path and the commands that analyze the
+    working tree live, so all of them build the same graph from the same
+    parser and the same synthetic edge steps.
+
+    ``read_only`` is for those live commands: the parse cache is read but
+    never written, and no structural episodes or centrality cache are kept.
+
+    Files that fail to read/parse are skipped and reported as a count rather than
+    swallowed silently. ``source_map`` is populated only when ``collect_sources``
+    is set; every path that persists the graph sets it, since the framework-edge
+pass reads the sources.
+
+    ``timings`` is the run's shared :class:`PhaseTimings` table; each step
+    below records into it under a ``rebuild.*`` name. ``None`` records nothing.
+
+    Returns ``(parsed_files, source_map, graph_builder, repo_structure,
+    file_count)``.
+    """
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+
+    from repowise.core.ingestion import FileTraverser, GraphBuilder
+
+    log = log or _noop_log
+
+    traverser = FileTraverser(
+        repo_path,
+        extra_exclude_patterns=exclude_patterns or None,
+        include_submodules=include_submodules,
+        include_nested_repos=include_nested_repos,
+    )
+    # Parallel stat + header sniffing, mirroring the init ingestion phase.
+    # A serial traverse() pays per-file I/O latency sequentially; on a cold
+    # OS file cache that was ~50s of every PowerToys-scale update. Passing
+    # the file_infos into get_repo_structure also avoids its re-walk.
+    with timed(timings, "rebuild.traverse"):
+        all_paths = list(traverser._walk())
+        io_workers = min(32, max(4, (os.cpu_count() or 4) * 2))
+        with ThreadPoolExecutor(max_workers=io_workers) as io_pool:
+            maybe_infos = list(io_pool.map(traverser._build_file_info, all_paths))
+        file_infos = [fi for fi in maybe_infos if fi is not None]
+        repo_structure = traverser.get_repo_structure(file_infos)
+
+    # Structural episodes, minus the formatter check: this path is the hot one
+    # (every update, plus the config-triggered re-score), so it derives only
+    # what the walk has already paid for and never spawns a subprocess.
+    if not read_only:
+        _record_structural_episodes(repo_path, traverser)
+
+    # Thread-pool source reads + content-hash parse cache split, shared with
+    # the init parse phase: only changed files need a tree-sitter parse.
+    # Cache failures degrade to all-miss (full parse), as before.
+    from repowise.core.pipeline.phases.ingestion import (
+        _read_sources,
+        _split_cached,
+    )
+    from repowise.core.workspace.update import get_head_commit
+
+    with timed(timings, "rebuild.read"):
+        fi_and_bytes = _read_sources(file_infos, None)
+        parse_cache, cached_hits, to_parse = _split_cached(Path(repo_path), fi_and_bytes, None)
+    if read_only:
+        parse_cache = None  # hits above still count; misses are not stored
+
+    graph_builder = GraphBuilder(
+        repo_path,
+        exclude_patterns=exclude_patterns,
+        centrality_cache_dir=None if read_only else Path(repo_path) / ".repowise",
+        head_commit=get_head_commit(Path(repo_path)),
+        include_submodules=include_submodules,
+        include_nested_repos=include_nested_repos,
+    )
+    graph_builder.console_scripts = traverser.console_script_names
+    # Carry the walk's skip record to the dead-code analyzer. This report is
+    # persisted repo-wide, so an update that could not see the skipped source
+    # files would re-derive and write back the verdicts init had clamped.
+    graph_builder.traversal_stats = traverser.stats
+    # Reconciliation authority is the successful traversal, not the successful
+    # parse set. A transient read/parser failure must not make an existing
+    # in-scope file look deleted and prune its persisted rows.
+    graph_builder.traversed_file_paths = {
+        file_info.path for file_info in file_infos
+    }
+
+    # Parse the misses in process and serially: on the update path they are
+    # change-sized. (Ceiling: a wiped/stale cache re-parses everything on one
+    # core; routing large miss counts through init's process pool would lift
+    # it, at the cost of Windows spawn overhead on every routine update.)
+    merged = _parse_misses(cached_hits, to_parse, parse_cache, timings)
+
+    skipped = len(file_infos) - len(fi_and_bytes)  # unreadable files
+    # Opened here and closed after build(): graph construction is the add_file
+    # loop plus the resolver, and the tsconfig wiring sits between them.
+    if timings is not None:
+        timings.start("rebuild.graph")
+    parsed_files, source_map, unparsed = _add_parsed_files(
+        graph_builder, fi_and_bytes, merged, collect_sources
+    )
+    skipped += unparsed
+
+    # TS/JS path aliases (``@/components/...``) resolve only when the
+    # tsconfig resolver is attached before build(); without it the alias
+    # targets read as external nodes and every aliased file looks
+    # unreachable to the dead-code analyzer (#648 — this rebuild path was
+    # missed when the CLI commands were wired).
+    from repowise.core.ingestion import wire_tsconfig_resolver
+
+    wire_tsconfig_resolver(
+        graph_builder,
+        repo_path,
+        include_submodules=include_submodules,
+        include_nested_repos=include_nested_repos,
+    )
+    graph_builder.set_source_map(source_map)
+    graph_builder.set_pytest_roots(traverser.pytest_roots)
+    graph_builder.build()
+    if timings is not None:
+        timings.stop("rebuild.graph")
+    if parse_cache is not None:
+        with timed(timings, "rebuild.cache_save"):
+            parse_cache.save()
+
+    if skipped:
+        log(f"[yellow]Skipped {skipped} file(s) that failed to parse.[/yellow]")
+
+    _add_synthetic_edges(repo_path, graph_builder, file_infos, source_map, log, timings)
 
     return parsed_files, source_map, graph_builder, repo_structure, len(file_infos)
 
@@ -808,7 +869,7 @@ def run_partial_analysis(
         # files they cover; the stored rows carry every other file, which is
         # what init's analyzer had and this path did not.
         _dead_code_git_meta = {**(stored_git_meta or {}), **git_meta_map}
-        # Files the walk dropped on size or for having no language spec. This
+        # Files the walk dropped (size, no language spec, generated). This
         # report is persisted repo-wide (see below), so without them an update
         # would re-derive the verdicts init had clamped and write them back
         # unclamped — the #1237 cascade would return, looking like the fix had
@@ -820,13 +881,9 @@ def run_partial_analysis(
             parsed_files=graph_builder._parsed_files,
             source_map=source_map,
             repo_root=repo_path,
-            unindexed_source_files=[
-                (skipped.path, skipped.reason)
-                for skipped in (
-                    *getattr(_traversal_stats, "skipped_source_files", []),
-                    *getattr(_traversal_stats, "unknown_language_files", []),
-                )
-            ],
+            unindexed_source_files=(
+                _traversal_stats.unindexed_source_files() if _traversal_stats is not None else []
+            ),
             dotnet_index=getattr(graph_builder, "dotnet_index", None),
         )
         # Repo-wide, and persisted repo-wide. The detectors were always
@@ -866,7 +923,10 @@ def run_partial_analysis(
                 "the rest keep their previous verdict[/yellow]"
             )
         if dead_code_report.total_findings:
-            log(f"Dead code findings: [yellow]{dead_code_report.total_findings}[/yellow]")
+            log(
+                f"Dead code findings: [yellow]{dead_code_report.total_findings}[/yellow]"
+                " repo-wide, every kind"
+            )
     except Exception as exc:
         log(f"[yellow]Dead code analysis skipped: {exc}[/yellow]")
     finally:
@@ -1123,6 +1183,7 @@ async def refresh_unchanged_history(
         upsert_health_findings,
         upsert_health_metrics,
     )
+    from repowise.core.pipeline.persist import _analyzed_commit
 
     stored = {
         m.file_path: m
@@ -1156,8 +1217,9 @@ async def refresh_unchanged_history(
     # re-inserts them, which means new ids and a reset ``created_at`` — so that
     # only happens for a file whose history findings actually changed, not for
     # every file whose stored split was merely never recorded.
+    commit = await _analyzed_commit(session, repo_id)
     metric_writes = [
-        _refreshed_metric(r, stored[r.file_path])
+        _refreshed_metric(r, stored[r.file_path], commit)
         for r in refreshed
         if _numbers_moved(r, stored[r.file_path])
     ]
@@ -1232,18 +1294,25 @@ def _history_findings_moved(refreshed: Any, stored_findings: list[Any]) -> bool:
     return key(refreshed.findings) != key(stored_findings)
 
 
-def _refreshed_metric(refreshed: Any, stored: Any) -> dict:
+def _refreshed_metric(refreshed: Any, stored: Any, commit: str | None) -> dict:
     """The stored metric row with the rescored numbers written over it.
 
     A dict rather than a dataclass so the fields this pass cannot know — the
     complexity and coverage columns, which need a parse — keep their stored
     values instead of being reset to a default.
+
+    ``commit`` is the one the row was rescored against: its history is read at
+    it, and the file is unchanged since its last parse. Keeping the old stamp
+    made the newest row name a commit 100 behind, which the health basis
+    reads. Set here, not as the writer's default, so an unreadable HEAD
+    clears the stamp: "not recorded" is honest and the old commit is not.
     """
     # A file health never walked carries no complexity figures either, which
     # also clears the ones a store written before that rule kept.
     walked = refreshed.score is not None
     return {
         "file_path": refreshed.file_path,
+        "analyzed_commit": commit,
         "score": refreshed.score,
         "max_ccn": stored.max_ccn if walked else None,
         "max_nesting": stored.max_nesting if walked else None,
@@ -1274,13 +1343,15 @@ async def persist_partial_health(
     and metrics across an incremental ``repowise update``.
     """
     from repowise.core.persistence.crud import (
+        PayoffContext,
         finalize_performance_opportunities,
         finalize_refactoring_opportunities,
         upsert_health_findings,
         upsert_health_metrics,
         upsert_refactoring_suggestions,
+        write_function_facts,
     )
-    from repowise.core.pipeline.persist import _analyzed_commit
+    from repowise.core.pipeline.persist import _analyzed_commit, path_liveness
 
     changed_paths = sorted(
         set(getattr(report, "authoritative_paths", None) or ())
@@ -1289,6 +1360,9 @@ async def persist_partial_health(
     performance_paths = sorted(
         set(getattr(report, "performance_authoritative_paths", None) or ()) - set(changed_paths)
     )
+    # Nothing analysed: a deletion-only update runs no health analysis, so it
+    # has no role map to restamp stored roles with. Roles, like performance
+    # findings, refresh on the next run that analyses any file.
     if not changed_paths and not performance_paths:
         return
     analyzed_commit = await _analyzed_commit(session, repo_id)
@@ -1329,6 +1403,27 @@ async def persist_partial_health(
                     if suggestion.refactoring_type != "performance_fix"
                 ],
                 file_paths=changed_paths,
+                # Before the facts below replace the stored ones: those are the
+                # measures a resolved plan was detected against.
+                payoff=PayoffContext(
+                    fact_rows=getattr(report, "function_facts", None),
+                    is_live=path_liveness(repo_path),
+                    commit=analyzed_commit,
+                ),
+            )
+        # Facts for the files this run walked; roles and nearest tests for every
+        # stored row, written only where they moved. No rows means no graph to
+        # key them on: the stored ones stay. Before the finalizers, which read
+        # each plan's nearest tests off these rows.
+        fact_rows = getattr(report, "function_facts", None)
+        if fact_rows is not None:
+            await write_function_facts(
+                session,
+                repo_id,
+                fact_rows,
+                file_paths={*changed_paths, *performance_paths},
+                roles=getattr(report, "execution_roles", None),
+                tests=getattr(report, "function_tests", None),
             )
         # A partial run sees a subset of the findings, so the plans and the
         # queue it would derive are a subset too. Both are rebuilt here instead,
@@ -1341,6 +1436,7 @@ async def persist_partial_health(
             repo_id,
             analyzed_commit=analyzed_commit,
             plan_policy=getattr(report, "performance_plan_policy", None),
+            execution_roles=getattr(report, "execution_roles", None),
         )
         # Repository-wide, like the queue above and for the same reason: an
         # opportunity folds a file's plans, and a file this run did not touch
@@ -1398,6 +1494,7 @@ async def persist_incremental_commits(
     """
     from repowise.core.ingestion.git_indexer import GitIndexer
     from repowise.core.persistence.crud import (
+        clear_attribution_if_disabled,
         get_latest_commit_committed_at,
         get_repository,
         update_repo_git_totals,
@@ -1441,15 +1538,11 @@ async def persist_incremental_commits(
             await upsert_git_commits_bulk(session, repo_id, rows)
         if file_rows:
             await upsert_git_commit_files_bulk(session, repo_id, file_rows)
+    await clear_attribution_if_disabled(session, repo_id)
 
-    # What the new commits did to health. An update is a handful of commits, so
-    # this is seconds; the same budget still applies if a long gap made it many.
-    with timed(timings, "persist.commits.health"):
-        from .commit_health import recent_shas, refresh_commit_health
-
-        await refresh_commit_health(
-            session, repo_id, str(repo_path), recent_shas(rows)
-        )
+    # What the new commits did to health is scanned by the caller once this
+    # transaction commits (commit_health.refresh_commit_health_after_update):
+    # the scan can take minutes and must not hold the write lock.
 
     with timed(timings, "persist.commits.experience"):
         await reconcile_commit_experience(session, repo_id, indexer)
@@ -1457,6 +1550,14 @@ async def persist_incremental_commits(
     # new capture never needs a re-index to become useful.
     with timed(timings, "persist.commits.offsets"):
         await reconcile_commit_offsets(session, repo_id, indexer)
+    with timed(timings, "persist.commits.changes"):
+        from repowise.core.changes.store import reconcile_categories, refresh_changes
+
+        await refresh_changes(session, repo_id, repo_path, rebuild=False)
+        try:
+            await reconcile_categories(session, repo_id)
+        except Exception as exc:
+            logger.debug("category_reconcile_failed", error=str(exc))
 
     # Refresh the repo-level whole-history totals so age / commit / contributor
     # counts keep growing between full re-indexes (#730). Cheap git calls, and
@@ -1794,6 +1895,79 @@ async def refresh_external_systems(
     return True
 
 
+async def prune_deleted_files(
+    session: Any,
+    repo_id: str,
+    repo_path: Any,
+    graph_builder: Any,
+    live_paths: Iterable[str],
+    *,
+    health_report: Any,
+    skip: Callable[[str, Exception], None],
+    log: LogFn,
+    degraded: list[str] | None,
+    timings: PhaseTimings | None,
+) -> None:
+    """Drop file-scoped rows for deleted files, then rebuild the queues built from them.
+
+    Shared by every update writer. Liveness is asked of disk and git, never of
+    this run's parse (see prune_deleted_file_rows).
+
+    Call it last in the session: the steps before it upsert, and the git step
+    indexes deleted paths too, so an earlier prune would be undone.
+
+    The graph's file nodes join *live_paths* because resolver passes mint
+    file-shaped nodes that name no file (`external:`, `framework:`, Spring SPI
+    sources); they fail every liveness test, and only changed files' edges are
+    rebuilt afterwards. A graph that cannot be read skips the prune.
+    """
+    pruned = 0
+    try:
+        from repowise.core.pipeline.persist import prune_deleted_file_rows
+
+        live_hint = set(live_paths) | {
+            node
+            for node, data in graph_builder.graph().nodes(data=True)
+            if data.get("node_type", "file") == "file"
+        }
+        with timed(timings, "persist.prune"):
+            pruned, refusals = await prune_deleted_file_rows(
+                session, repo_id, repo_path, live_hint=live_hint
+            )
+        if pruned:
+            log(f"Pruned rows for [cyan]{pruned}[/cyan] deleted file(s)")
+        for refusal in refusals:
+            log(f"[yellow]{refusal}[/yellow]")
+            if degraded is not None:
+                degraded.append(refusal)
+    except Exception as exc:
+        skip("Deleted-file prune", exc)
+
+    # The performance and refactoring queues are materialized from the health
+    # findings the prune just deleted; without this they keep serving a cause
+    # whose evidence is gone, on a file the store no longer claims exists.
+    if not pruned:
+        return
+    try:
+        from repowise.core.persistence.crud import (
+            finalize_performance_opportunities,
+            finalize_refactoring_opportunities,
+        )
+        from repowise.core.pipeline.persist import _analyzed_commit
+
+        analyzed_commit = await _analyzed_commit(session, repo_id)
+        await finalize_performance_opportunities(
+            session,
+            repo_id,
+            analyzed_commit=analyzed_commit,
+            plan_policy=getattr(health_report, "performance_plan_policy", None),
+            execution_roles=getattr(health_report, "execution_roles", None),
+        )
+        await finalize_refactoring_opportunities(session, repo_id, analyzed_commit=analyzed_commit)
+    except Exception as exc:
+        skip("Queue rebuild after prune", exc)
+
+
 async def persist_incremental_index(
     repo_path: Any,
     graph_builder: Any,
@@ -1807,8 +1981,10 @@ async def persist_incremental_index(
     file_diffs: list[Any] | None = None,
     knowledge_graph_result: Any | None = None,
     parsed_files: list[Any] | None = None,
+    source_map: dict[str, Any] | None = None,
     git_decay_map: dict | None = None,
     full_git_summary: Any | None = None,
+    history_window_changed: bool = False,
     reconcile_full_scope: bool = False,
     full_generation_page_ids: set[str] | None = None,
     vector_store: Any | None = None,
@@ -1882,7 +2058,7 @@ async def persist_incremental_index(
         async with get_session(sf) as session:
             with timed(timings, "persist.open"):
                 repo = await upsert_repository(
-                    session, name=repo_path.name, local_path=str(repo_path)
+                    session, name=repo_path.name, local_path=str(repo_path), stamp_head=True
                 )
             repo_id = repo.id
 
@@ -1984,6 +2160,7 @@ async def persist_incremental_index(
                             git_meta_map,
                             git_decay_map,
                             full_git_summary,
+                            keep_commit_health=not history_window_changed,
                         )
                 except Exception as exc:
                     _skip("Git persist", exc, range_scoped=True)
@@ -2033,6 +2210,22 @@ async def persist_incremental_index(
                     # run, so a skipped write heals itself on the next update.
                     _skip("Doc-drift persist", exc)
 
+            # Re-persist graph_nodes so symbol-level PageRank /
+            # betweenness / community ids stay in sync with the
+            # current graph build. Without this, ``repowise update``
+            # leaves stale per-symbol metrics from the original init
+            # and the UI shows "Not indexed in graph" for every
+            # symbol on existing repos. Before health, whose plan
+            # annotations read each symbol's ``public_api`` from here; a
+            # failed write leaves them reading the last run's flags.
+            try:
+                from repowise.core.pipeline.persist import persist_graph_nodes
+
+                with timed(timings, "persist.graph_nodes"):
+                    await persist_graph_nodes(session, repo_id, graph_builder, timings=timings)
+            except Exception as exc:
+                _skip("Graph nodes persist", exc)
+
             if partial_health_report is not None:
                 try:
                     with timed(timings, "persist.health"):
@@ -2041,20 +2234,6 @@ async def persist_incremental_index(
                         )
                 except Exception as exc:
                     _skip("Health persist", exc, range_scoped=True)
-
-            # Re-persist graph_nodes so symbol-level PageRank /
-            # betweenness / community ids stay in sync with the
-            # current graph build. Without this, ``repowise update``
-            # leaves stale per-symbol metrics from the original init
-            # and the UI shows "Not indexed in graph" for every
-            # symbol on existing repos.
-            try:
-                from repowise.core.pipeline.persist import persist_graph_nodes
-
-                with timed(timings, "persist.graph_nodes"):
-                    await persist_graph_nodes(session, repo_id, graph_builder, timings=timings)
-            except Exception as exc:
-                _skip("Graph nodes persist", exc)
 
             # Refresh wiki_symbols for the changed files. Historically the
             # incremental path re-parsed but never persisted symbols, so their
@@ -2068,6 +2247,16 @@ async def persist_incremental_index(
                     await persist_incremental_symbols(session, repo_id, parsed_files, changed_paths)
             except Exception as exc:
                 _skip("Symbol persist", exc, range_scoped=True)
+
+            try:
+                from repowise.core.pipeline.persist import persist_incremental_security_findings
+
+                with timed(timings, "persist.security"):
+                    await persist_incremental_security_findings(
+                        session, repo_id, parsed_files, source_map, changed_paths
+                    )
+            except Exception as exc:
+                _skip("Security persist", exc, range_scoped=True)
 
             # Refresh graph_edges for the changed files. The full-init path was
             # historically the only writer of edges, so adjacency froze at the
@@ -2135,96 +2324,46 @@ async def persist_incremental_index(
                 )
 
                 await purge_proposed_decisions_by_source(session, repo_id, "code_comment")
-                if full_git_summary is not None:
+                # A history-window change re-mines these; a walk that only
+                # refreshes rows under new rules does not, so it keeps them.
+                if full_git_summary is not None and history_window_changed:
                     await purge_proposed_decisions_by_source(
                         session, repo_id, "git_archaeology"
                     )
             except Exception as exc:
                 _skip("Decision purge", exc)
 
-            pruned = 0
-            # Drop file-scoped rows for files that have actually been deleted.
-            # Without this an incremental update tombstones the deleted file's
-            # page and leaves everything else: graph nodes, edges, metrics,
-            # symbols, health rows and git metadata all keep serving a file
-            # that is gone. The liveness question is asked of the filesystem
-            # and git, never of this run's parse, so a transient read failure
-            # cannot masquerade as a deletion (see prune_deleted_file_rows).
-            #
-            # Last in the session on purpose. Everything above upserts rather
-            # than deleting, and the git step in particular indexes the changed
-            # *paths*, which includes the deleted ones: pruning first left a
-            # fresh git_metadata row for every file this run watched disappear.
-            # Running last means the prune has the final say on what the store
-            # claims exists.
-            try:
-                from repowise.core.pipeline.persist import prune_deleted_file_rows
-
-                live_hint = set(
+            # Last in the session on purpose: everything above upserts, and the
+            # git step indexes the changed *paths*, deleted ones included, so
+            # the prune has to have the final say on what the store claims.
+            await prune_deleted_files(
+                session,
+                repo_id,
+                repo_path,
+                graph_builder,
+                (
                     current_graph_file_paths
                     if current_graph_file_paths is not None
                     else {pf.file_info.path for pf in parsed_files or []}
-                )
-                # Plus every file node the rebuilt graph still holds, which is
-                # the only reliable way to know a node names no file at all.
-                # Framework and resolver passes mint file-shaped nodes for
-                # things that were never on disk: `external:` imports,
-                # `framework:` anchors, and Spring's `META-INF/services/<iface>`
-                # SPI source, which carries no prefix to recognise it by. All
-                # of them fail every liveness test there is, so a prune that
-                # asked only about disk and git would delete them and take
-                # their edges with them, and only *changed* files' edges are
-                # rebuilt afterwards. A node this run's graph build still
-                # contains is live by construction, whatever it names.
-                #
-                # Deliberately not guarded: a graph this run cannot read is a
-                # run that has no business deciding what was deleted, and the
-                # outer handler skips the prune entirely.
-                graph = graph_builder.graph()
-                live_hint |= {
-                    node
-                    for node, data in graph.nodes(data=True)
-                    if data.get("node_type", "file") == "file"
-                }
-                with timed(timings, "persist.prune"):
-                    pruned, refusals = await prune_deleted_file_rows(
-                        session, repo_id, repo_path, live_hint=live_hint
-                    )
-                if pruned:
-                    log(f"Pruned rows for [cyan]{pruned}[/cyan] deleted file(s)")
-                for refusal in refusals:
-                    log(f"[yellow]{refusal}[/yellow]")
-                    if degraded is not None:
-                        degraded.append(refusal)
-            except Exception as exc:
-                _skip("Deleted-file prune", exc)
+                ),
+                health_report=partial_health_report,
+                skip=_skip,
+                log=log,
+                degraded=degraded,
+                timings=timings,
+            )
+            # The transaction commits as the block exits.
+            if timings is not None:
+                timings.start("persist.commit")
+        if timings is not None:
+            timings.stop("persist.commit")
 
-            # The prune deletes the health findings of files that are gone, and
-            # the performance and refactoring queues are materialized from those
-            # findings. Without this they keep serving a cause whose evidence was
-            # removed a moment ago, on a file the store no longer claims exists.
-            # After the prune for the same reason the prune runs last: only now
-            # is the surviving finding set final.
-            if pruned:
-                try:
-                    from repowise.core.persistence.crud import (
-                        finalize_performance_opportunities,
-                        finalize_refactoring_opportunities,
-                    )
-                    from repowise.core.pipeline.persist import _analyzed_commit
+        # Every update, not only those with git changes: a backlog an earlier
+        # budget left drains here, and an empty window costs one query.
+        from repowise.core.pipeline.commit_health import refresh_commit_health_after_update
 
-                    analyzed_commit = await _analyzed_commit(session, repo_id)
-                    await finalize_performance_opportunities(
-                        session,
-                        repo_id,
-                        analyzed_commit=analyzed_commit,
-                        plan_policy=getattr(partial_health_report, "performance_plan_policy", None),
-                    )
-                    await finalize_refactoring_opportunities(
-                        session, repo_id, analyzed_commit=analyzed_commit
-                    )
-                except Exception as exc:
-                    _skip("Queue rebuild after prune", exc)
+        with timed(timings, "persist.commit_health"):
+            await refresh_commit_health_after_update(sf, repo_id, str(repo_path))
 
         # After the session closes: on SQLite the full-text index shares the
         # database file, so writing to it while the session holds a write lock

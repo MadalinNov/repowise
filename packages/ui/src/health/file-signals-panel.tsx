@@ -1,7 +1,7 @@
 "use client";
 
 import type { FileSignals } from "@repowise-dev/types/health";
-import { formatRelativeTimeOrNull } from "../lib/format";
+import { formatRelativeTimeOrNull, ordinal } from "../lib/format";
 
 export interface FileSignalsPanelProps {
   signals: FileSignals | null | undefined;
@@ -45,7 +45,7 @@ export function FileSignalsPanel({ signals, hideHeading = false }: FileSignalsPa
             value={
               signals.change_entropy_pct == null
                 ? null
-                : `${Math.round(signals.change_entropy_pct)}th pct`
+                : `${ordinal(Math.round(signals.change_entropy_pct))} pct`
             }
             caption="change scatter: how spread out its edits are"
             present={signals.change_entropy_pct != null}
@@ -214,7 +214,7 @@ function Row({
       >
         {present ? value : "No signal"}
         {present && badge != null && (
-          <span className="rounded-full border border-[var(--color-accent-muted)] bg-[var(--color-accent-muted)] px-1.5 py-px text-[9px] font-medium uppercase tracking-wide text-[var(--color-accent-primary)]">
+          <span className="rounded-full border border-[var(--color-border-default)] bg-[var(--color-bg-elevated)] px-1.5 py-px font-mono text-[10px] font-medium uppercase tracking-wide text-[var(--color-text-secondary)]">
             {badge}
           </span>
         )}

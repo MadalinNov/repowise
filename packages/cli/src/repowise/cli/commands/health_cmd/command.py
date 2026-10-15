@@ -1,14 +1,16 @@
 """``repowise health`` Click command + single-repo orchestration.
 
-Mirrors the dead-code CLI: ingest → analyze → render. Reads from
-``HealthFileMetric`` / ``HealthFinding`` if a fresh index exists, falls
-back to a live in-process analysis when run outside an indexed repo.
+Reads the health analysis the last ``init``/``update`` stored, the same rows
+MCP and the web UI serve, and writes nothing. ``--recompute`` runs the
+analysis in-process instead (ingest, analyze, render) and, for a whole-repo
+table, writes it back to the index.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import click
 from rich.table import Table
@@ -23,6 +25,7 @@ from repowise.cli.helpers import (
     run_async,
     silence_logs_for_machine_output_until_close,
 )
+from repowise.core.analysis.finding_registry import preview_lines
 from repowise.core.analysis.health.counts import (
     COUNTS,
     DEFAULT_COUNTS,
@@ -32,18 +35,23 @@ from repowise.core.analysis.health.counts import (
     project as project_counts,
 )
 from repowise.core.analysis.health.models import split_by_origin
-from repowise.core.analysis.health.rows import split_unscored
+from repowise.core.analysis.health.ranking import deduction_by_path
+from repowise.core.analysis.health.rows import detail_map, split_unscored
 from repowise.core.analysis.health.scope import DEFAULT_SCOPE, SCOPES, parse_scope
 from repowise.core.analysis.health.scoring import compute_kpis
+from repowise.core.persistence.crud.analysis.health import open_finding_count
 
 from .codegen import _generate_refactoring_code
 from .persist import (
     _load_fix_first,
     _load_persisted_coverage_map,
+    _load_queue_counts,
     _load_recommendations,
+    _load_stored_report,
     _persist_health,
 )
 from .refactoring_targets import (
+    _render_plan_recipe,
     _render_refactoring_targets,
     _render_stored_refactoring_targets,
 )
@@ -99,12 +107,23 @@ FIX_FIRST_ROWS = 3
     ),
 )
 @click.option(
+    "--plan",
+    "plan_id",
+    default=None,
+    metavar="ID",
+    help=(
+        "Print one stored refactoring plan as the recipe an agent applies: its "
+        "preconditions, steps and checks (JSON with --format json)."
+    ),
+)
+@click.option(
     "--recompute",
     is_flag=True,
     default=False,
     help=(
-        "With --refactoring-targets: analyze the working tree in-process instead "
-        "of reading the index. Slow on a large repo; needed outside an indexed one."
+        "Analyze the working tree in-process instead of reading the stored "
+        "analysis, and write a whole-repo table run back to the index. Slow on a "
+        "large repo; needed outside an indexed one."
     ),
 )
 @click.option(
@@ -170,6 +189,7 @@ def health_command(
     repo_alias: str | None,
     no_workspace: bool,
     refactoring_targets: bool,
+    plan_id: str | None,
     recompute: bool,
     generate_code: str | None,
     module_filter: str | None,
@@ -179,18 +199,12 @@ def health_command(
     badge_view: bool,
     verbose: bool,
 ) -> None:
-    """Compute code-health scores from markers (CCN, nesting, brain-method).
+    """Code-health scores from markers (CCN, nesting, brain-method).
 
-    Runs in-process — no LLM, no network. Re-uses the repowise ingestion
-    parser, graph builder, and git indexer.
+    Reads the analysis the index stored; no LLM, no network, no writes.
+    ``--recompute`` re-runs it in-process over the working tree.
     """
     configure_cli_logging(verbose=verbose)
-
-    from pathlib import Path as PathlibPath
-
-    from repowise.core.analysis.communities import file_community_labels
-    from repowise.core.analysis.health import HealthAnalyzer
-    from repowise.core.ingestion import ASTParser, FileTraverser, GraphBuilder
 
     # Silence structlog/stdlib info+debug lines when the user asked for a
     # machine-readable format so stdout is pure JSON/Markdown and safe to
@@ -237,6 +251,14 @@ def health_command(
         _render_trend(repo_path, fmt=fmt)
         return
 
+    if plan_id is not None:
+        if not _render_plan_recipe(repo_path, plan_id, fmt=fmt):
+            raise click.ClickException(
+                f"No stored refactoring plan {plan_id}. `repowise health --refactoring-targets` "
+                "lists the current plans."
+            )
+        return
+
     if refactoring_targets and not recompute and generate_code is None:
         # The stored queue is the calibrated reading, as on MCP and the web UI.
         if parse_scope(scope) != DEFAULT_SCOPE or parse_counts(counts) != DEFAULT_COUNTS:
@@ -253,97 +275,20 @@ def health_command(
             )
         return
 
-    # Analyze the same file set that was indexed: a repo initialized with
-    # --include-submodules persists the flag in state.json, and a flagless
-    # traverser here would silently score a different (smaller) tree.
-    state = load_state(repo_path)
-    include_submodules = bool(state.get("include_submodules", False))
-    include_nested_repos = bool(state.get("include_nested_repos", False))
-    # `repowise health` persists metrics into the same rows the indexer writes,
-    # so it has to analyze the same file set. Without the config's exclude
-    # patterns it scored — and overwrote rows for — files the index had
-    # deliberately dropped, and on a repo excluding a manifest directory it
-    # could write a different `module` than the index did.
-    exclude_patterns: list[str] = list(load_config(repo_path).get("exclude_patterns") or [])
-
-    traverser = FileTraverser(
-        repo_path,
-        include_submodules=include_submodules,
-        include_nested_repos=include_nested_repos,
-        extra_exclude_patterns=exclude_patterns or None,
-    )
-    file_infos = list(traverser.traverse())
-    parser = ASTParser()
-    graph_builder = GraphBuilder(
-        repo_path,
-        include_submodules=include_submodules,
-        include_nested_repos=include_nested_repos,
-    )
-
-    parsed_files = []
-    for fi in file_infos:
-        try:
-            source = PathlibPath(fi.abs_path).read_bytes()
-            parsed = parser.parse_file(fi, source)
-            graph_builder.add_file(parsed)
-            parsed_files.append(parsed)
-        except Exception:
-            continue
-
-    from repowise.core.ingestion import wire_tsconfig_resolver
-
-    wire_tsconfig_resolver(
-        graph_builder,
-        repo_path,
-        include_submodules=include_submodules,
-        include_nested_repos=include_nested_repos,
-    )
-    graph_builder.build()
-
-    git_meta_map: dict = {}
-    try:
-        from repowise.core.ingestion.git_indexer import GitIndexer
-
-        git_indexer = GitIndexer(repo_path)
-        _, metadata_list = run_async(git_indexer.index_repo(""))
-        git_meta_map = {m["file_path"]: m for m in metadata_list}
-    except Exception:
-        pass
-
-    # Coverage folds into scoring from whatever `repowise coverage add` (or
-    # index-time ingest) persisted - no per-run flag. Ingestion lives solely
-    # in the `coverage` command group.
-    coverage_map = _load_persisted_coverage_map(repo_path)
-
-    analyzer = HealthAnalyzer(
-        graph_builder.graph(),
-        git_meta_map=git_meta_map,
-        parsed_files=parsed_files,
-        community_label_map=file_community_labels(graph_builder),
-        coverage_map=coverage_map,
-        duplication_cache_dir=Path(repo_path) / ".repowise",
-        repo_root=repo_path,
-    )
-    # Load any .repowise/health-rules.json the user keeps in the repo.
-    from repowise.core.analysis.health.config import HealthConfig
-
-    health_cfg = HealthConfig.load(repo_path)
-    analyzer_cfg = (
-        health_cfg.to_analyzer_config([pf.file_info.path for pf in parsed_files])
-        if (health_cfg.disabled_biomarkers or health_cfg.rules)
-        else None
-    )
-    report = analyzer.analyze(analyzer_cfg)
-
-    # Persist health to the repo's wiki.db so the dashboard, MCP tools, and
-    # `repowise status` see the same numbers as this CLI run.
-    #
-    # Skip when fmt != "table" (json/md are read by scripts and CI; side
-    # effects are unwelcome) or when the run is filtered to a single
-    # file/module (those are inspection runs that shouldn't overwrite
-    # repo-level state).
-    if fmt == "table" and not file_filter and not module_filter:
-        _persist_health(repo_path, report=report)
+    if recompute or generate_code is not None:
+        # Written back only for a whole-repo table: json/md are read by scripts
+        # and CI, and a file or module run is an inspection, not repo state.
+        report, hotspots, languages = _recompute_report(
+            repo_path, persist=fmt == "table" and not file_filter and not module_filter
+        )
+    else:
+        stored = _load_stored_report(repo_path)
+        if stored is None:
+            raise click.ClickException(
+                "No stored health analysis for this repository. Run `repowise init` "
+                "or `repowise update`, or pass --recompute to analyze in-process."
+            )
+        report, hotspots, languages = stored
 
     metrics = report.metrics
     if file_filter:
@@ -369,7 +314,10 @@ def health_command(
         # one of them: it scores the ranking against `prior_defect`, and
         # narrowing leaves it no labels to be accurate about.
         report.kpis = compute_kpis(
-            metrics, {p for p, m in git_meta_map.items() if m.get("is_hotspot")}
+            metrics,
+            hotspots,
+            unanalysed=unanalysed,
+            deductions=deduction_by_path(report.findings),
         )
     metrics_sorted = sorted(metrics, key=lambda m: m.score)
 
@@ -393,7 +341,7 @@ def health_command(
             suggestions = [s for s in suggestions if s.file_path.startswith(module_filter)]
         # Attaches the same batched validation block the read surfaces emit;
         # code generation remains explicitly requested and never auto-applies.
-        _load_recommendations(repo_path, suggestions, metrics_sorted)
+        _load_recommendations(repo_path, suggestions, metrics_sorted, findings)
         _generate_refactoring_code(repo_path, suggestions, generate_code, fmt=fmt)
         return
 
@@ -403,12 +351,12 @@ def health_command(
             suggestions = [s for s in suggestions if s.file_path == file_filter]
         if module_filter:
             suggestions = [s for s in suggestions if s.file_path.startswith(module_filter)]
-        recommendations = _load_recommendations(repo_path, suggestions, metrics_sorted)
+        recommendations = _load_recommendations(repo_path, suggestions, metrics_sorted, findings)
         _render_refactoring_targets(metrics_sorted, findings, recommendations, fmt=fmt)
         return
 
     if badge_view:
-        _render_badge(report.kpis.get("average_health"))
+        _render_badge(report.kpis.get("average_health"), report.kpis.get("analysed_share"))
         return
 
     if fmt == "json":
@@ -418,6 +366,9 @@ def health_command(
                     "kpis": report.kpis,
                     "scope": parse_scope(scope),
                     "counts": parse_counts(counts),
+                    # Findings, causes, plans and Fix first items, as every
+                    # surface counts them; ``shown`` is 0, nothing is listed.
+                    "queue_counts": _load_queue_counts(repo_path),
                     "metrics": [
                         {
                             "file_path": m.file_path,
@@ -439,7 +390,7 @@ def health_command(
                             "file_path": f.file_path,
                             "function_name": f.function_name,
                             "health_impact": f.health_impact,
-                            "details": f.details,
+                            "details": detail_map(f),
                             "reason": f.reason,
                         }
                         for f in findings
@@ -466,7 +417,9 @@ def health_command(
     from repowise.core.analysis.health.grading import (
         BAND_LABEL,
         BAND_TERMINAL_COLOR,
+        analysed_note,
         band_for,
+        headline_band,
     )
     from repowise.core.analysis.health.grading import (
         distribution as health_distribution,
@@ -479,8 +432,8 @@ def health_command(
     kpis = report.kpis
     avg = kpis.get("average_health")
     band_str = ""
-    if isinstance(avg, (int, float)):
-        band = band_for(float(avg))
+    band = headline_band(avg, kpis.get("analysed_share"))
+    if band is not None:
         band_color = BAND_TERMINAL_COLOR[band]
         band_str = f" [[{band_color}]{BAND_LABEL[band]}[/{band_color}]]"
     console.print(
@@ -496,18 +449,19 @@ def health_command(
             f"[dim]{unanalysed} file(s) not analysed: health does not support "
             "their language yet.[/dim]"
         )
+    # The share behind the headline, from the same counts as its band.
+    note = analysed_note(kpis.get("file_count") or 0, kpis.get("unanalysed_file_count") or 0)
+    if note:
+        console.print(f"[dim]Code health {note}.[/dim]")
     _render_split_line(kpis)
     _render_distribution_line(health_distribution(metrics))
 
     _render_defect_accuracy_line(report)
 
     # Performance pillar section: lead with the finding COUNT + density +
-    # coverage (the honest signal), not the bounded /10 average. Language comes
-    # from the parsed files (the in-memory metrics don't carry it).
-    _render_performance_section(
-        report,
-        {pf.file_info.path: pf.file_info.language for pf in parsed_files},
-    )
+    # coverage (the honest signal), not the bounded /10 average. Metrics carry
+    # no language, so it comes with the report from either source.
+    _render_performance_section(report, languages)
 
     table = Table(title=f"Lowest-scoring files ({min(len(metrics_sorted), 20)})")
     table.add_column("File", style="cyan")
@@ -529,7 +483,8 @@ def health_command(
     console.print(table)
 
     if findings:
-        console.print(f"\n[bold]{len(findings)}[/bold] marker findings:")
+        # The total get_overview prints; advisory rows are listed, not counted.
+        console.print(f"\n[bold]{open_finding_count(findings)}[/bold] open findings:")
         f_table = Table()
         f_table.add_column("Severity", style="magenta")
         f_table.add_column("Marker", style="cyan")
@@ -545,3 +500,77 @@ def health_command(
                 f"-{f.health_impact:.2f}",
             )
         console.print(f_table)
+        for line in preview_lines("health", findings[:30], kind="biomarker_type"):
+            console.print(f"[dim]{line}[/dim]")
+
+
+def _recompute_report(repo_path: Path, *, persist: bool) -> tuple[Any, set[str], dict[str, str]]:
+    """Analyze the working tree in-process: ``(report, hotspot paths, language by path)``.
+
+    ``persist`` writes the result to the index, as ``init`` would, so the
+    dashboard, MCP tools and ``repowise status`` see the same numbers.
+    """
+    from repowise.core.analysis.communities import file_community_labels
+    from repowise.core.analysis.health import HealthAnalyzer
+    from repowise.core.analysis.health.config import HealthConfig
+
+    graph_builder, parsed_files = _parse_tree(repo_path)
+    git_meta_map: dict = {}
+    try:
+        from repowise.core.ingestion.git_indexer import GitIndexer
+
+        _, metadata_list = run_async(GitIndexer(repo_path).index_repo(""))
+        git_meta_map = {m["file_path"]: m for m in metadata_list}
+    except Exception:
+        pass
+
+    analyzer = HealthAnalyzer(
+        graph_builder.graph(),
+        git_meta_map=git_meta_map,
+        parsed_files=parsed_files,
+        community_label_map=file_community_labels(graph_builder),
+        # Coverage folds in from whatever `repowise coverage add` (or index-time
+        # ingest) persisted; ingestion lives solely in the `coverage` group.
+        coverage_map=_load_persisted_coverage_map(repo_path),
+        duplication_cache_dir=Path(repo_path) / ".repowise",
+        repo_root=repo_path,
+    )
+    # Any .repowise/health-rules.json the user keeps in the repo.
+    health_cfg = HealthConfig.load(repo_path)
+    analyzer_cfg = (
+        health_cfg.to_analyzer_config([pf.file_info.path for pf in parsed_files])
+        if (health_cfg.disabled_biomarkers or health_cfg.rules)
+        else None
+    )
+    report = analyzer.analyze(analyzer_cfg)
+    if persist:
+        _persist_health(repo_path, report=report)
+    hotspots = {p for p, m in git_meta_map.items() if m.get("is_hotspot")}
+    return report, hotspots, {pf.file_info.path: pf.file_info.language for pf in parsed_files}
+
+
+def _parse_tree(repo_path: Path) -> tuple[Any, list[Any]]:
+    """``(graph builder, parsed files)`` over the file set the index analyzed.
+
+    The graph is the one ``update`` builds (framework, pytest-root and
+    dynamic-hint edges included), since ``--recompute`` persists into the
+    rows the indexer writes. ``read_only`` keeps the parse cache, centrality
+    cache and structural episodes untouched.
+    """
+    from repowise.core.pipeline.incremental import build_repo_graph
+
+    # A repo initialized with --include-submodules persists the flag in
+    # state.json, and a flagless traverser would score a smaller tree.
+    state = load_state(repo_path)
+    # Without the config's exclude patterns it scored, and overwrote rows for,
+    # files the index had dropped, and on a repo excluding a manifest
+    # directory it could write a different `module`.
+    parsed_files, _sources, graph_builder, _structure, _count = build_repo_graph(
+        repo_path,
+        list(load_config(repo_path).get("exclude_patterns") or []),
+        collect_sources=True,
+        include_submodules=bool(state.get("include_submodules", False)),
+        include_nested_repos=bool(state.get("include_nested_repos", False)),
+        read_only=True,
+    )
+    return graph_builder, parsed_files

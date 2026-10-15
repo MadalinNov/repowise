@@ -10,13 +10,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
-def _render_tool_table() -> str:
+def _render_tool_table(*, keyless: bool = False) -> str:
     # Local import: tool_table is a leaf module; importing lazily keeps data.py
     # free of import-order coupling for the many tests that build these
     # dataclasses directly.
     from .tool_table import render_tool_table
 
-    return render_tool_table()
+    return render_tool_table(keyless=keyless)
 
 
 @dataclass(frozen=True)
@@ -67,12 +67,14 @@ class CodeHealthBlock:
 
     hotspot_health: float
     average_health: float
-    worst_score: float
-    worst_path: str
+    worst_score: float | None
+    worst_path: str | None
     # The band word for ``average_health``, so the line reads the same
     # direction as every other surface: a bare "6.9/10" beside a risk-shaped
     # label is the one reading that inverts.
     band: str = ""
+    # "analysed N of M code files" when health left some out; ``None`` otherwise.
+    analysed_note: str | None = None
     # ``None`` until two snapshots exist; the section then omits the label.
     hotspot_trend: str | None = None
     # Maintainability pillar headline (NLOC-weighted average over the per-file
@@ -130,10 +132,23 @@ class EditorFileData:
     code_health: CodeHealthBlock | None = None
     kg_layers: list[KGLayerSummary] = field(default_factory=list)
     kg_tour: list[KGTourStepSummary] = field(default_factory=list)
-    # Rendered MCP tool table (single source: tool_table.py). A data field
-    # rather than a Jinja global so any environment can render the template.
-    tool_table_md: str = field(default_factory=lambda: _render_tool_table())
     index_scope: dict = field(default_factory=dict)
+
+    @property
+    def keyless(self) -> bool:
+        """Whether the index was built with no model: template prose, no semantic search."""
+        scope = self.index_scope
+        search = scope.get("search") if isinstance(scope.get("search"), dict) else {}
+        return (
+            scope.get("content_provenance") in ("template", "none")
+            and search.get("semantic") == "unavailable"
+        )
+
+    @property
+    def tool_table_md(self) -> str:
+        # Rendered MCP tool table (single source: tool_table.py). Exposed on the
+        # data rather than as a Jinja global so any environment can render it.
+        return _render_tool_table(keyless=self.keyless)
 
 
 # ---------------------------------------------------------------------------
@@ -165,5 +180,6 @@ class WorkspaceEditorFileData:
     package_deps: list[dict] = field(default_factory=list)  # package dep entries
     contract_links: list[dict] = field(default_factory=list)  # matched contract links
     contracts_by_type: dict[str, int] = field(default_factory=dict)  # {"http": 5, …}
-    # Rendered MCP tool table (single source: tool_table.py).
+    # Rendered MCP tool table (single source: tool_table.py). Always the keyed
+    # table: member repos can differ in keyless state, and one keyed repo needs it.
     tool_table_md: str = field(default_factory=lambda: _render_tool_table())

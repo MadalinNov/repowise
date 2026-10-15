@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.pool import StaticPool
 
 from repowise.core.persistence.crud import code_file_rows
+from repowise.core.persistence.crud.analysis.plain_rows import plain_rows
 from repowise.core.persistence.database import get_session
 from repowise.core.persistence.models import GitMetadata
 from repowise.core.registry import mcp_tool_registry as mcp
 from repowise.server.mcp_server import _state
 from repowise.server.mcp_server._budget import OmissionCollector
+from repowise.server.mcp_server._changes import overview_changes
+from repowise.server.mcp_server._components import component_list
 from repowise.server.mcp_server._helpers import (
     _get_exclude_spec,
     _get_repo,
@@ -61,12 +67,10 @@ async def get_overview(repo: str | None = None, include: list[str] | None = None
     Returns the overview summary, key modules, entry points, architecture
     layers and package dependencies, code health, repo-wide git health, and
     ``next_actions`` (top work for the week and quarter).
-    Skip this on subsequent calls — once you have the map, jump straight to
-    ``get_context`` / ``get_answer``.
+    Skip it on later calls; go straight to ``get_context`` / ``get_answer``.
 
-    Compact by default: ``content_md`` carries only the overview essay's summary
-    section, and the outline, onboarding, ownership and graph blocks ship only
-    on request. The response's ``more`` field names them.
+    Compact by default: ``content_md`` carries only the essay's summary
+    section; other blocks ship on request, named in ``more``.
 
     Defaults fit 24,000 chars; nonempty ``include`` uses 32,000. Reductions
     carry counts and recovery status in ``_meta``.
@@ -79,7 +83,7 @@ async def get_overview(repo: str | None = None, include: list[str] | None = None
     - ``repo="<alias>"`` targets one specific repo.
 
     Args:
-        repo: Repository alias, path, or ID. Use ``"all"`` for workspace overview.
+        repo: Repository alias, path, or ID, or ``"all"``.
         include: Opt-in extras, any combination of:
             ``"content"`` — the full overview essay instead of its summary.
             ``"outline"`` — the stored wiki page tree, two rungs deep.
@@ -87,6 +91,8 @@ async def get_overview(repo: str | None = None, include: list[str] | None = None
             ``"decisions"`` — ``key_decisions``; ``get_why`` is richer.
             ``"graph"`` — ``community_summary``, code-community clusters.
             ``"ownership"`` — ``knowledge_map``: top 3 owners by files owned.
+            ``"components"`` — component list with file counts.
+            ``"changes"`` — changes by category, week and source, with coverage.
     """
     if repo == "all":
         return await _workspace_overview()
@@ -98,9 +104,21 @@ async def get_overview(repo: str | None = None, include: list[str] | None = None
     collector = OmissionCollector("get_overview", repo_root=ctx.path)
     async with get_session(ctx.session_factory) as session:
         repository = await _get_repo(session)
+        want = set(include or [])
         result = await _repo_overview(
-            session, repository, exclude_spec, set(include or []), collector
+            session, ctx.session_factory, repository, exclude_spec, want, collector
         )
+        if "components" in want:
+            result["components"] = await component_list(
+                session,
+                repository,
+                repo_root=ctx.path,
+                alias=ctx.alias,
+                exclude_spec=exclude_spec,
+                collector=collector,
+            )
+        if "changes" in want:
+            result["changes"] = await overview_changes(session, repository)
 
         # Made once per session, so this is where the full scope that every
         # other response's compact projection points at is worth its bytes.
@@ -111,25 +129,34 @@ async def get_overview(repo: str | None = None, include: list[str] | None = None
 
 async def _repo_overview(
     session: Any,
+    session_factory: Any,
     repository: Any,
     exclude_spec: Any,
     want: set[str],
     collector: OmissionCollector,
 ) -> dict[str, Any]:
-    """Every single-repo block, in payload order; empty optional blocks are left out."""
-    overview_page = await _load_overview_page(session, repository)
-    module_pages = await _load_module_pages(session, repository, collector)
-    entry_point_ids = await _resolve_entry_point_ids(session, repository, exclude_spec)
-    all_git = await _load_git_rows(session, repository, exclude_spec)
-    architecture = await _build_architecture(session, repository)
-    dependencies = await _build_package_dependencies(session, repository, exclude_spec)
-    if dependencies:
-        architecture = {**architecture, "dependencies": dependencies}
-    code_health = await _build_code_health(session, repository)
-    next_actions, next_actions_reason = await _build_next_actions(session, repository)
-    requested = await _requested_blocks(session, repository, exclude_spec, all_git, want)
-    sections, outline = await _load_outline(session, repository, want, collector)
+    """Every single-repo block, in payload order; empty optional blocks are left out.
+
+    Code health and the next actions are the slow reads and need nothing else
+    here, so each runs on its own read session while the rest is read.
+    """
+    slow = _slow_reads(session, session_factory, repository)
+    try:
+        overview_page = await _load_overview_page(session, repository)
+        module_pages = await _load_module_pages(session, repository, collector)
+        entry_point_ids = await _resolve_entry_point_ids(session, repository, exclude_spec)
+        all_git = await _load_git_rows(session, repository, exclude_spec)
+        architecture = await _build_architecture(session, repository)
+        dependencies = await _build_package_dependencies(session, repository, exclude_spec)
+        if dependencies:
+            architecture = {**architecture, "dependencies": dependencies}
+        requested = await _requested_blocks(session, repository, exclude_spec, all_git, want)
+        sections, outline = await _load_outline(session, repository, want, collector)
+    except BaseException:
+        await _abandon(slow)
+        raise
     content_md, content_hint = _overview_content(overview_page, "content" in want)
+    code_health, (next_actions, next_actions_reason) = await slow
 
     result: dict[str, Any] = {
         "title": _resolve_title(overview_page, repository),
@@ -180,6 +207,45 @@ async def _repo_overview(
     return result
 
 
+def _slow_reads(session: Any, session_factory: Any, repository: Any) -> Awaitable[Any]:
+    """``(code health, next actions)``: started now on their own sessions, or,
+    on a store whose sessions share one connection, read later on *session*."""
+    if not _own_connections(session_factory):
+        return _in_turn(session, repository)
+
+    async def apart(build: Any) -> Any:
+        async with get_session(session_factory) as own:
+            return await build(own, repository)
+
+    return asyncio.gather(apart(_build_code_health), apart(_build_next_actions))
+
+
+async def _in_turn(session: Any, repository: Any) -> tuple[Any, Any]:
+    return (
+        await _build_code_health(session, repository),
+        await _build_next_actions(session, repository),
+    )
+
+
+async def _abandon(slow: Any) -> None:
+    """Stop the slow reads when the rest failed, so no task outlives the call."""
+    if isinstance(slow, asyncio.Future):
+        slow.cancel()
+        await asyncio.gather(slow, return_exceptions=True)
+    else:
+        slow.close()  # an in-turn read that never started
+
+
+def _own_connections(session_factory: Any) -> bool:
+    """Whether each session gets its own connection, so two can read at once.
+
+    A ``StaticPool`` (in-memory SQLite) hands every session the same one, where
+    their savepoints would collide.
+    """
+    bind = session_factory.kw.get("bind")
+    return bind is not None and not isinstance(bind.sync_engine.pool, StaticPool)
+
+
 _OUTLINE_HINT = (
     "The stored page tree — the same outline the web app and the "
     "editor extension render. Every 'section' in this response "
@@ -195,12 +261,24 @@ _READING_ORDER_HINT = (
 )
 
 
+#: What git health and the ownership map read off each row. Every code file
+#: has one, so hydrating whole rows (their JSON history columns included) cost
+#: most of a warm overview on a large repository.
+_GIT_ROW_COLUMNS = (
+    GitMetadata.file_path,
+    GitMetadata.bus_factor,
+    GitMetadata.is_hotspot,
+    GitMetadata.commit_count_30d,
+    GitMetadata.commit_count_90d,
+    GitMetadata.primary_owner_email,
+    GitMetadata.primary_owner_name,
+)
+
+
 async def _load_git_rows(session: Any, repository: Any, exclude_spec: Any) -> list[Any]:
     """Git metadata rows outside the exclude rules, the source of git health and ownership."""
-    git_res = await session.execute(
-        select(GitMetadata).where(code_file_rows(repository.id))
-    )
-    return filter_rows_by_attr(list(git_res.scalars().all()), "file_path", exclude_spec)
+    git_res = await session.execute(select(*_GIT_ROW_COLUMNS).where(code_file_rows(repository.id)))
+    return filter_rows_by_attr(plain_rows(git_res), "file_path", exclude_spec)
 
 
 async def _requested_blocks(

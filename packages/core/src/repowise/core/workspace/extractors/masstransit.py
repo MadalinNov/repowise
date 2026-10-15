@@ -675,7 +675,7 @@ def _open_consumers(decls: list[_ClassDecl]) -> dict[tuple[str, int], _OpenConsu
                     hit = _OpenConsumer(lowered.index(got[0].lower()), got[1])
                     break
             key = (d.name.lower(), len(d.tparams))
-            if hit is None or key in known and known[key] in (hit, None):
+            if hit is None or (key in known and known[key] in (hit, None)):
                 continue
             # Two classes sharing a name and arity that disagree are not trusted.
             known[key] = None if key in known else hit

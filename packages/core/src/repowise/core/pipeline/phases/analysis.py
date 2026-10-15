@@ -41,6 +41,7 @@ _DECISION_SOURCE_LABELS: tuple[tuple[str, str], ...] = (
     ("comment", "from comments"),
     ("session", "from agent sessions"),
     ("session_discovery", "from session discovery"),
+    ("conventions", "from code conventions"),
 )
 
 
@@ -63,17 +64,10 @@ async def _run_dead_code_analysis(
         if progress:
             progress.on_phase_start("dead_code", dead_code_steps)
 
-        # Files the traverser dropped on size, plus those it dropped for having
-        # no language spec. Without them the analyzer cannot tell "nothing
-        # imports this" from "the importer was never read", which is the
-        # cascade in #1237.
-        unindexed_source_files = [
-            (skipped.path, skipped.reason)
-            for skipped in (
-                *getattr(traversal_stats, "skipped_source_files", []),
-                *getattr(traversal_stats, "unknown_language_files", []),
-            )
-        ]
+        # Files the traverser dropped; see TraversalStats.unindexed_source_files.
+        unindexed_source_files = (
+            traversal_stats.unindexed_source_files() if traversal_stats is not None else []
+        )
 
         analyzer = DeadCodeAnalyzer(
             graph_builder.graph(),
@@ -480,11 +474,17 @@ async def _run_decision_extraction(
                 if bs.get(source)
             ]
             summary = ", ".join(found) if found else ""
-            progress.on_message(
-                "info",
-                f"→ {report.total_found} architectural decisions found"
-                + (f": {summary}" if summary else ""),
+            # The per-source counts are taken before the evidence gate and the
+            # total after it, so "5 found: 13 from git history, 3 from
+            # comments" did not add up. Say which number is which.
+            candidates = sum(bs.values())
+            headline = (
+                f"→ {report.total_found} architectural decisions kept from "
+                f"{candidates} candidates"
+                if candidates > report.total_found
+                else f"→ {report.total_found} architectural decisions found"
             )
+            progress.on_message("info", headline + (f": {summary}" if summary else ""))
             # And the sources that produced nothing. Hiding these was what made
             # a source failing outright indistinguishable from a source with
             # honestly nothing to find: every failure inside the extractor is

@@ -5,7 +5,8 @@
  */
 
 import type { Hotspot } from "./git.js";
-import type { DefectAccuracy, HealthSeverity } from "./health.js";
+import type { DefectAccuracy, HealthBand, HealthSeverity } from "./health.js";
+import type { QueueCounts } from "./queue.js";
 
 export interface OverviewRepoMeta {
   id: string;
@@ -71,11 +72,19 @@ export interface OverviewStats {
 export interface OverviewHealthHistoryPoint {
   taken_at: string | null;
   average_health: number;
-  hotspot_health: number;
+  /** Null on a snapshot whose repo had no scored hotspot file. */
+  hotspot_health: number | null;
 }
 
 export interface OverviewHealth {
   average_health: number | null;
+  /** Files health has no dialect for, left out of every figure. */
+  unanalysed_file_count?: number;
+  /** Scored files over all code files, 0-1; `null` with no code files. */
+  analysed_share?: number | null;
+  /** Band for `average_health`; `null` when too few code files were analysed
+   *  to grade the repo. Absent on an older server. */
+  band?: HealthBand | null;
   /** Backtested precision of the defect ranking — the "can you trust this
    *  score?" panel on the health card. Optional so an older server payload
    *  simply omits the panel. */
@@ -84,6 +93,8 @@ export interface OverviewHealth {
   worst_performer_path: string | null;
   worst_performer_score: number | null;
   open_findings: number;
+  /** The findings' count vocabulary; the same numbers the Code Health page shows. */
+  finding_counts?: QueueCounts;
   /** Co-equal maintainability pillar headline (NLOC-weighted). `null` when no
    *  file carries a maintainability score yet. */
   maintainability_average?: number | null;

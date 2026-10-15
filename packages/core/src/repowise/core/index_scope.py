@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
@@ -225,6 +226,17 @@ def resolve_index_scope(
 COMPACT_INDEX_SCOPE_PROJECTION = "compact"
 CANONICAL_INDEX_SCOPE_PROJECTION = "full"
 
+#: Degraded-analysis entries the compact scope names; the count stays exact and
+#: the full list rides on the canonical scope.
+_DEGRADED_ANALYSES_SHOWN = 3
+
+_ANALYSIS_ID_RE = re.compile(r"[a-z][a-z0-9_]*")
+
+
+def _free_text_last(entry: str) -> bool:
+    """Sort key putting bare analysis ids (``health``) ahead of free-text run warnings."""
+    return _ANALYSIS_ID_RE.fullmatch(entry) is None
+
 #: Set to ``full`` to serve the canonical scope everywhere, as builds before
 #: the compact projection did. The compatibility window for a reader that
 #: parses the whole object and cannot yet ask for it by name.
@@ -233,7 +245,9 @@ INDEX_SCOPE_ENV = "REPOWISE_MCP_INDEX_SCOPE"
 
 #: Upgrade states that mean the index is still being built. Reported ahead of
 #: everything else: they explain the rest and they resolve on their own.
-_UPGRADE_IN_FLIGHT = frozenset({"pending", "running", "resumable"})
+#: ``pending`` joins them only when the run had a provider (see
+#: :func:`_upgrade_in_flight`).
+_UPGRADE_IN_FLIGHT = frozenset({"running", "resumable"})
 
 #: Search legs. A leg that is "pending" is not usable yet, which is a smaller
 #: problem than one that failed but is not nothing.
@@ -246,13 +260,48 @@ def _section(scope: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     return section if isinstance(section, Mapping) else {}
 
 
+def _upgrade_in_flight(upgrade: Mapping[str, Any], scope: Mapping[str, Any]) -> bool:
+    """Whether the model upgrade is under way or waiting on a provider it has.
+
+    Every run without a model stores ``pending`` (``update --full`` reads it),
+    but with no provider nothing will ever take it up, so a keyless index is
+    finished and reads by its evidence like any other.
+    """
+    status = upgrade.get("status")
+    if status in _UPGRADE_IN_FLIGHT:
+        return True
+    return status == "pending" and bool(_section(scope, "provider").get("name"))
+
+
+def _never_meant_to_exist(leg: str, scope: Mapping[str, Any]) -> bool:
+    """Whether an unavailable search leg is the run's design, not a failure.
+
+    A run that skipped generation has no pages to search. A keyless run (no
+    provider, keyless or no embedder) never writes semantic vectors. A real
+    embedder whose writes failed is neither, and stays degraded.
+    """
+    from repowise.core.providers.embedding.registry import KEYLESS_EMBEDDERS
+
+    if "generation" in (_section(scope, "analysis").get("skipped") or ()):
+        return True
+    provider = _section(scope, "provider")
+    return (
+        leg == "semantic"
+        and not provider.get("name")
+        and (not provider.get("embedder") or provider.get("embedder") in KEYLESS_EMBEDDERS)
+    )
+
+
 def _is_degraded(upgrade: Mapping[str, Any], scope: Mapping[str, Any]) -> bool:
     """Whether some part of the index was meant to exist and does not."""
     search = _section(scope, "search")
     return (
         upgrade.get("status") == "failed"
         or bool(_section(scope, "analysis").get("unavailable"))
-        or any(search.get(leg) == "unavailable" for leg in _SEARCH_LEGS)
+        or any(
+            search.get(leg) == "unavailable" and not _never_meant_to_exist(leg, scope)
+            for leg in _SEARCH_LEGS
+        )
     )
 
 
@@ -291,7 +340,7 @@ def _scope_status(scope: Mapping[str, Any]) -> str:
     ``unknown``, which is a different answer and says so.
     """
     upgrade = _section(scope, "upgrade")
-    if upgrade.get("status") in _UPGRADE_IN_FLIGHT:
+    if _upgrade_in_flight(upgrade, scope):
         return "upgrading"
     if _is_degraded(upgrade, scope):
         return "degraded"
@@ -332,7 +381,8 @@ def compact_index_scope(
 
     The one exception is ``degraded_analyses``, carried only when non-empty:
     which analysis is missing changes what an answer means, and "health failed"
-    and "the graph failed" are not the same warning.
+    and "the graph failed" are not the same warning. A long list is sampled,
+    with its exact count.
     """
     if not isinstance(scope, Mapping):
         return None
@@ -348,7 +398,15 @@ def compact_index_scope(
     }
     unavailable = _section(scope, "analysis").get("unavailable")
     if unavailable:
-        compact["degraded_analyses"] = list(unavailable)
+        entries = list(unavailable)
+        if len(entries) > _DEGRADED_ANALYSES_SHOWN:
+            entries.sort(key=_free_text_last)
+        shown = entries[:_DEGRADED_ANALYSES_SHOWN]
+        compact["degraded_analyses"] = shown
+        if len(unavailable) > len(shown):
+            compact["degraded_analyses_total"] = len(unavailable)
+            compact["degraded_analyses_emitted"] = len(shown)
+            compact["degraded_analyses_reduced_reason"] = "compact_projection"
     return compact
 
 

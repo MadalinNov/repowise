@@ -27,14 +27,14 @@ To persist the choice, put it in `.repowise/config.yaml`:
 
 ```yaml
 provider: claude_cli
-model: claude_cli/claude-haiku-4-5
+model: claude_cli/claude-haiku-5-5
 ```
 
 ### Prerequisites
 
 ```bash
 # Install Claude Code, then authenticate once:
-claude login
+claude auth login
 ```
 
 Any plan that can run `claude -p` works — Pro, Max, Team or Enterprise. Repowise
@@ -83,18 +83,18 @@ booked into the `llm_costs` ledger (at $0.00) so `repowise costs` shows the run.
 
 ### Default model
 
-`claude_cli/claude-haiku-4-5` is the default, matching the `anthropic` provider,
+`claude_cli/claude-haiku-5-5` is the default, matching the `anthropic` provider,
 whose docstring calls haiku "ample for doc pages". To choose another:
 
 ```bash
-repowise init --provider claude_cli --model claude_cli/claude-sonnet-4-6
+repowise init --provider claude_cli --model claude_cli/claude-sonnet-5-5
 ```
 
 The `claude_cli/` prefix is optional on input — a bare slug works too, and both
 round-trip through `.repowise/config.yaml`:
 
 ```bash
-repowise init --provider claude_cli --model claude-opus-4-6
+repowise init --provider claude_cli --model claude-opus-5-5
 ```
 
 ### Concurrency

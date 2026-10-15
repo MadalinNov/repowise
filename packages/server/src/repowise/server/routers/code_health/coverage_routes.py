@@ -214,7 +214,7 @@ async def _inferred_coverage(
 
     Degrades to ``basis: "none"`` rather than raising. An unindexed graph is the
     honest unknown, and failing the tab to withhold a secondary signal is the
-    wrong trade - the same call ``pr_blast._inferred_guarding_tests`` makes.
+    wrong trade.
     """
     try:
         test_files = await load_test_files(session, repo_id)
@@ -421,6 +421,7 @@ async def health_coverage_patch(
         label=label,
         head_commit=head_sha or None,
         config=configured_coverage(repo.local_path),
+        repo_path=repo.local_path,
     )
     if patch is None:
         return None

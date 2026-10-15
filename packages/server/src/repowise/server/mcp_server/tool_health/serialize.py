@@ -143,11 +143,12 @@ def _refactoring_plan_id(r: Any, repository: str) -> str:
 def _serialize_refactoring(
     r: Any, repository: str | None = None
 ) -> dict[str, Any]:
-    """Compatibility adapter; request paths hydrate through the async service."""
+    """One plan in full, as plan detail serves it; request paths hydrate
+    through the async service."""
     if isinstance(r, Recommendation):
-        payload = r.as_dict()
+        payload = r.detail_dict()
     else:
-        payload = build_recommendations([r])[0].as_dict()
+        payload = build_recommendations([r])[0].detail_dict()
     if repository is not None:
         payload["id"] = _refactoring_plan_id(r, repository)
         payload["repository"] = repository
@@ -188,4 +189,6 @@ def _serialize_metric(
         "primary_biomarker": lead.get("primary_biomarker") if lead else None,
         "primary_reason": lead.get("primary_reason") if lead else None,
         "total_deduction": lead.get("total_deduction") if lead else None,
+        # Only when a type this surface withholds took points off the score.
+        **({"withheld_deduction": w} if lead and (w := lead.get("withheld_deduction")) else {}),
     }

@@ -18,7 +18,13 @@
 import type { C4IoKind } from "./external-systems.js";
 import type { CoverageHistoryPoint, CoverageSummary } from "./generated/http.js";
 import type { Paginated } from "./pagination.js";
-import type { StepClassification, ValidationBasis, ValidationVia } from "./refactoring.js";
+import type { QueueCounts, QueueCountsByUnit } from "./queue.js";
+import type {
+  StepClassification,
+  StepVerify,
+  ValidationBasis,
+  ValidationVia,
+} from "./refactoring.js";
 
 /** Finding severity used across the health surface. */
 export type HealthSeverity = "low" | "medium" | "high" | "critical";
@@ -345,9 +351,29 @@ export interface HealthFinding {
   /** Why the finding can wait ("lower priority: ..."); null when it is worth
    *  doing first. Lower-priority findings are listed after the rest. */
   lower_priority?: string | null;
+  /** The measurement note when the row's language cell is served as a preview;
+   *  null or absent for a validated cell. */
+  preview?: string | null;
 }
 
 export type PerformanceExecutionContext = "production" | "tooling" | "test" | "unknown";
+
+/**
+ * What runs a cause's loop (`execution_roles.EXECUTION_ROLES`). `unknown` means
+ * no request, job, startup or CLI seed reaches it, not that nothing does.
+ */
+export const PERFORMANCE_EXECUTION_ROLES = [
+  "request",
+  "event_consumer",
+  "scheduled_job",
+  "startup",
+  "cli",
+  "ui",
+  "tooling",
+  "test",
+  "unknown",
+] as const;
+export type PerformanceExecutionRole = (typeof PERFORMANCE_EXECUTION_ROLES)[number];
 export type PerformanceOpportunityConfidence = "high" | "medium" | "low";
 
 export interface PerformanceOpportunityFix {
@@ -400,6 +426,8 @@ export interface PerformanceOpportunityFacets {
   change_risk: string;
   /** Absent on rows stored before the fact existed. */
   loop_magnitude?: PerformanceLoopMagnitude;
+  /** Absent on rows stored before the fact existed. */
+  execution_role?: PerformanceExecutionRole;
 }
 
 /**
@@ -435,6 +463,9 @@ export interface PerformanceOpportunityPlanStep {
   file_path: string | null;
   line: number | null;
   applicability: StepClassification;
+  /** How to check this step, when it differs from the plan's validation.
+   *  Absent: the plan's validation checks it. */
+  verify?: StepVerify;
 }
 
 /** Ranking inputs behind a plan, not a cost/benefit ledger. */
@@ -496,6 +527,9 @@ export interface PerformanceOpportunity {
   /** Why the opportunity can wait ("lower priority: ..."); null when its
    *  production loop is known to grow with the data. */
   lower_priority?: string | null;
+  /** The measurement note when the row's language cell is served as a preview;
+   *  null or absent for a validated cell. */
+  preview?: string | null;
   /** Exact stored match. Never inferred from file, marker, or rank. */
   plan_id: string | null;
   plan_status: PerformancePlanStatus;
@@ -561,7 +595,17 @@ export type PerformanceFacetKey =
   | "boundary"
   | "confidence"
   | "actionability"
-  | "plan_state";
+  | "plan_state"
+  | "proof"
+  | "role";
+
+/**
+ * Whether anything measured that a cause's cost grows with the data
+ * (`eligibility.QUEUE_PROOFS`). The queue holds `proven` causes unless asked
+ * for another value. `background_unproven` is a scheduled job whose loop is
+ * not shown to grow; neither unproven kind leads.
+ */
+export type PerformanceCostProof = "proven" | "unproven" | "background_unproven";
 
 export type PerformanceFacets = Partial<Record<PerformanceFacetKey, PerformanceFacetCount[]>>;
 
@@ -584,6 +628,10 @@ export type PerformanceOpportunityQuery = {
   /** Evidence confidence, requested apart from fix safety and actionability. */
   confidence?: PerformanceOpportunityConfidence;
   actionability?: PerformanceActionabilityState;
+  /** Absent means `proven`; `unproven` lists the causes the default queue leaves out. */
+  proof?: PerformanceCostProof;
+  /** Absent means every role but startup, cli, ui, tooling and test; `all` lists every role. */
+  role?: PerformanceExecutionRole | "all";
   /** `summary` drops the explanatory fields and keeps identity and counts. */
   view?: "detail" | "summary";
   sort?: "rank" | "leverage" | "observations";
@@ -597,10 +645,32 @@ export type PerformanceOpportunityQuery = {
   offset?: number;
 };
 
+/** Why the default queue leaves a cause out (`queue.eligibility.DEFAULT_QUEUE_EXCLUSIONS`). */
+export type PerformanceQueueExclusion =
+  | "test"
+  | "tooling"
+  | "unknown"
+  | "gated_off"
+  | "cold_path"
+  | "expected"
+  | "no_strategy"
+  | "unmeasured_cost"
+  | "cold_role"
+  | "background_unproven";
+
 export interface PerformanceDefaultQueue {
   total: number;
-  excluded: Record<"test" | "tooling" | "unknown" | "expected" | "no_strategy", number>;
+  /** Per reason; a server that predates a reason leaves it out. */
+  excluded: Partial<Record<PerformanceQueueExclusion, number>>;
 }
+
+/**
+ * A layer held back pending verification on a language is left out on files
+ * of that language unless the caller opts in (`include_unverified`). Keyed by
+ * language tag (`java`, `csharp`, `c`, `cpp`, `kotlin`, `swift`); `reason`
+ * is the sentence to show.
+ */
+export type GatedByLanguage = Record<string, { count: number; reason: string }>;
 
 export interface PerformanceOpportunitySummary {
   /** `current` once materialized, `stale_model` after a model bump, or
@@ -619,6 +689,8 @@ export interface PerformanceOpportunitySummary {
   actionability?: Partial<Record<PerformanceActionabilityState, number>>;
   context?: Partial<Record<PerformanceExecutionContext, number>>;
   boundary?: Record<string, number>;
+  /** Causes by cost proof; `unproven` ones sit outside the default queue. Absent on an older store. */
+  proof?: Partial<Record<PerformanceCostProof, number>>;
   with_plan_total: number;
   /** The queue a caller gets with no filter (production work with a strategy),
    *  and how many causes it leaves out per reason. Absent on an older store. */
@@ -626,13 +698,19 @@ export interface PerformanceOpportunitySummary {
   /** Why the queue is not current, when it is not. */
   reason?: string;
   detail?: string;
+  /** What a language gate held back, by language. Empty or absent when nothing was. */
+  gated?: GatedByLanguage;
 }
 
 export interface PerformanceOpportunityPage extends Paginated<PerformanceOpportunity> {
   summary: PerformanceOpportunitySummary;
   facets: PerformanceFacets;
+  /** What a language gate held back, by language. Empty or absent when nothing was. */
+  gated?: GatedByLanguage;
   /** Filter values the server did not recognize, named rather than dropped. */
   ignored_arguments?: Record<string, string>;
+  /** The causes' count vocabulary over the open inventory in the queried files. */
+  counts?: QueueCounts;
 }
 
 export interface HealthModuleRow {
@@ -665,6 +743,9 @@ export interface HealthOverviewSummary {
   /** Files left out of every figure here because health has no dialect for
    *  their language. Absent on an older server. */
   unanalysed_file_count?: number;
+  /** Scored files over all code files, 0-1; `null` with no code files. Absent
+   *  on an older server. */
+  analysed_share?: number | null;
   hotspot_health?: number | null;
   worst_performer_path: string | null;
   worst_performer_score: number | null;
@@ -679,8 +760,10 @@ export interface HealthOverviewSummary {
     medium: number;
     low: number;
   };
-  /** Repo-level band derived from `average_health` (added in the band/distribution layer). */
-  band?: HealthBand;
+  /** Repo-level band derived from `average_health` (added in the band/distribution layer).
+   *  `null` when no file is scored or too few code files were analysed to grade
+   *  the repo; absent on an older server. */
+  band?: HealthBand | null;
   /**
    * NLOC-weighted repo headline for the maintainability pillar (the second
    * surfaced signal). `null`/absent when no file carries a maintainability
@@ -717,6 +800,8 @@ export interface HealthOverviewSummary {
   counts?: HealthCounts;
   /** Files a code-shape reading cannot answer for, having no recorded split. */
   unscored_files?: number;
+  /** What a language gate held back, by language. Empty or absent when nothing was. */
+  gated?: GatedByLanguage;
 }
 
 export interface HealthOverviewResponse {
@@ -728,6 +813,8 @@ export interface HealthOverviewResponse {
   top_findings: HealthFinding[];
   modules?: HealthModuleRow[];
   biomarkers?: BiomarkerBreakdownRow[];
+  /** Every queue unit's counts, unprojected by the page's scope or counts. */
+  queue_counts?: QueueCountsByUnit;
   meta?: {
     last_indexed_at: string | null;
     head_commit: string | null;
@@ -887,6 +974,8 @@ export interface FileBreakdownCategory {
 
 export interface HealthFileBreakdownResponse {
   file_path: string;
+  /** What a language gate held back, by language. Empty or absent when nothing was. */
+  gated?: GatedByLanguage;
   metric: HealthFileMetric | null;
   /** `null` for a file with no score (no health dialect for its language). */
   breakdown: {
@@ -990,7 +1079,10 @@ export interface FileHealthTrend {
 export interface HealthTrendResponse {
   history: Array<{
     taken_at: string | null;
-    /** `null` under a narrowed scope, which recorded only the average. */
+    /**
+     * `null` under a narrowed scope, which recorded only the average, and on
+     * the full scope when that snapshot recorded no hotspot files.
+     */
     hotspot_health: number | null;
     average_health: number;
     worst_performer_path: string | null;
@@ -1008,7 +1100,10 @@ export interface HealthTrendResponse {
     doc_drift_count?: number | null;
   }>;
   summary: {
-    /** `null` under a narrowed scope: only the average covers both populations. */
+    /**
+     * `null` under a narrowed scope (only the average covers both populations),
+     * and on the full scope when the newest snapshot recorded no hotspot files.
+     */
     current_hotspot_health: number | null;
     current_average_health: number;
     previous_hotspot_health: number | null;

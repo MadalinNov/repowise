@@ -118,6 +118,55 @@ def test_status_names_the_condition_that_explains_the_rest(
     assert compact_index_scope(resolve_index_scope(state))["status"] == expected
 
 
+def test_a_pending_upgrade_with_a_provider_is_upgrading() -> None:
+    state = {**_FULL_STATE, "full_upgrade": {"status": "pending"}}
+    assert compact_index_scope(resolve_index_scope(state))["status"] == "upgrading"
+
+
+def _keyless_state(embedder: str | None, **scope: Any) -> dict[str, Any]:
+    """The scope a default keyless init stamps: no provider, no semantic vectors."""
+    return {
+        **_FULL_STATE,
+        "docs_mode": "deterministic",
+        "index_scope": {
+            "git_commit_cap": 500,
+            "file_pages": _WHOLE_PAGES,
+            "provider": {"name": None, "embedder": embedder},
+            "search": {"full_text": "available", "semantic": "unavailable"},
+            **scope,
+        },
+        "full_upgrade": {"status": "pending"},
+    }
+
+
+@pytest.mark.parametrize("embedder", ["mock", None])
+def test_a_finished_keyless_index_reads_complete(embedder: str | None) -> None:
+    """Nothing takes a keyless pending upgrade up, and no semantic leg was meant."""
+    state = _keyless_state(embedder)
+    assert compact_index_scope(resolve_index_scope(state))["status"] == "complete"
+
+
+@pytest.mark.parametrize("embedder", ["mock", None])
+def test_a_keyless_index_with_omitted_pages_reads_partial(embedder: str | None) -> None:
+    state = _keyless_state(embedder, file_pages={"eligible": 10, "generated": 8, "omitted": 2})
+    assert compact_index_scope(resolve_index_scope(state))["status"] == "partial"
+
+
+def test_a_fast_keyless_index_with_no_pages_reads_partial() -> None:
+    state = _keyless_state(
+        "mock",
+        file_pages={"eligible": 10, "generated": 0, "omitted": 10},
+        analysis={"skipped": ["generation"]},
+        search={"full_text": "unavailable", "semantic": "unavailable"},
+    )
+    assert compact_index_scope(resolve_index_scope(state))["status"] == "partial"
+
+
+def test_a_keyless_index_whose_real_embedder_failed_is_degraded() -> None:
+    state = _keyless_state("openai")
+    assert compact_index_scope(resolve_index_scope(state))["status"] == "degraded"
+
+
 def test_omitted_pages_are_never_reported_as_complete() -> None:
     """A partial index must not read as a whole one to save a word."""
     scope = resolve_index_scope(_FULL_STATE)
@@ -263,6 +312,32 @@ def test_a_degraded_index_names_what_degraded() -> None:
 
     assert compact["status"] == "degraded"
     assert compact["degraded_analyses"] == ["health"]
+    assert "degraded_analyses_total" not in compact
+
+
+def test_a_long_degraded_list_is_sampled_with_its_count() -> None:
+    """The canonical scope keeps every entry; the compact one names a few and counts all."""
+    names = [f"skipped file {i}" for i in range(17)]
+    scope = resolve_index_scope({**_FULL_STATE, "degraded": names})
+
+    compact = compact_index_scope(scope)
+
+    assert compact["degraded_analyses"] == sorted(names)[:3]
+    assert compact["degraded_analyses_total"] == 17
+    assert compact["degraded_analyses_emitted"] == 3
+    assert compact["degraded_analyses_reduced_reason"] == "compact_projection"
+    assert len(scope["analysis"]["unavailable"]) == 17
+
+
+def test_a_real_analysis_id_survives_a_flood_of_run_warnings() -> None:
+    """Warnings with a leading space sort first alphabetically; the id still shows."""
+    warnings = [f"  Not indexed: big/file_{i}.cs (3,000 KB, over the limit)" for i in range(16)]
+    scope = resolve_index_scope({**_FULL_STATE, "degraded": [*warnings, "dead_code"]})
+
+    compact = compact_index_scope(scope)
+
+    assert compact["degraded_analyses"][0] == "dead_code"
+    assert compact["degraded_analyses_total"] == 17
 
 
 def test_a_sound_index_carries_no_degraded_names() -> None:

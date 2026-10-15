@@ -16,6 +16,7 @@ from repowise.core.analysis.review_directive import (
     ReviewDirective,
     review_directive,
 )
+from repowise.server.mcp_server._test_selection import UNAVAILABLE_REASON
 
 #: Actionable findings carried in the default response. The rest are counted
 #: and recoverable by an exact call, never silently dropped.
@@ -52,13 +53,13 @@ def _test_evidence(tests: dict[str, Any] | None) -> CoveringTestEvidence:
         # report and nothing to ask for.
         return CoveringTestEvidence()
     to_run = tuple(tests.get("tests_to_run") or ())
-    if to_run:
-        state = "available"
-    elif tests.get("status") in {"no_map", "no_index"}:
-        state = "unavailable"
-    else:
-        state = "available"
-    return CoveringTestEvidence(state=state, tests_to_run=to_run, basis=tests.get("basis"))
+    state = "unavailable" if tests.get("status") == "no_index" else "available"
+    run_all = None
+    if tests.get("run_all"):
+        run_all = (tests.get("reasons") or [UNAVAILABLE_REASON])[0]
+    return CoveringTestEvidence(
+        state=state, tests_to_run=to_run, basis=tests.get("basis"), run_all=run_all
+    )
 
 
 def _render_actions(decided: ReviewDirective) -> list[str]:
@@ -80,7 +81,7 @@ def _render_action(action: ReviewAction, inspected: int) -> str | None:
         if inspected >= _ACTIONABLE_FINDINGS:
             return None
         return f"{action.explanation} ({action.targets[0]})"
-    if action.kind == "run_tests":
+    if action.kind == "run_tests" and action.targets:
         return f"Run: {' '.join(action.targets[:_TESTS_SHOWN])}"
     return action.explanation
 
@@ -90,20 +91,16 @@ def patch_coverage_action(block: dict[str, Any] | None) -> str | None:
 
     Names the scope and the tests to extend from the rows' hints, riskiest
     file first, so the agent writes the missing test where the suite already
-    exercises the code. Stale coverage leads instead: its gaps are not real yet.
+    exercises the code. Files changed since the coverage was measured lead
+    instead: they carry no figure until the tests run again.
     """
+    if stale := _stale_action(block):
+        return stale
     uncovered = block["coverable_line_count"] - block["covered_line_count"] if block else 0
     if uncovered <= 0:
         return _partial_action(block)
     lines = f"{uncovered} changed executable line{'' if uncovered == 1 else 's'}"
     lines += _scope_words(block["scope"].get("label") or "")
-    if block["scope"]["freshness"] == "stale":
-        # Stale line numbers describe other code: the fix is a fresh run first.
-        return (
-            "Stored coverage predates this change: re-run the tests with coverage, then "
-            "`repowise coverage add` (the hook does it automatically) and call again "
-            f"({lines} read as uncovered until then)"
-        )
     tests = _hinted_tests(block["files"])
     text = f"{lines} {'is' if uncovered == 1 else 'are'} uncovered; "
     if tests:
@@ -111,10 +108,22 @@ def patch_coverage_action(block: dict[str, Any] | None) -> str | None:
     return text + "add tests for them (patch_coverage.files)"
 
 
+def _stale_action(block: dict[str, Any] | None) -> str | None:
+    """Re-measure first when changed files have no figure because they changed since."""
+    stale = ((block or {}).get("file_counts") or {}).get("stale_file", 0)
+    if not stale:
+        return None
+    return (
+        "Stored coverage predates this change: re-run the tests with coverage, then "
+        "`repowise coverage add` (the hook does it automatically) and call again "
+        f"({stale} changed file{'' if stale == 1 else 's'} not measured until then)"
+    )
+
+
 def _partial_action(block: dict[str, Any] | None) -> str | None:
     """The next action when every changed line ran but some took only part of their branches."""
     partial = _partial_line_count(block)
-    if not partial or block["scope"]["freshness"] == "stale":
+    if not partial:
         return None
     lines = f"{partial} changed line{'' if partial == 1 else 's'}"
     lines += _scope_words(block["scope"].get("label") or "")

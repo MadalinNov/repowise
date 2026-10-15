@@ -96,6 +96,11 @@ const NARROWING: NarrowingSpec[] = [
   { key: "actionability", facet: "actionability", anyLabel: "All but expected" },
   { key: "boundary", facet: "boundary", anyLabel: "Any" },
   { key: "confidence", facet: "confidence", anyLabel: "Any" },
+  // Unproven causes (loop size unknown) are counted but never queued by default.
+  { key: "proof", facet: "proof", anyLabel: "Measured only" },
+  // Startup, CLI, tooling and test loops run once per process, so the default
+  // leaves them out; each role stays one selection away.
+  { key: "role", facet: "role", anyLabel: "Served paths" },
 ];
 
 /**
@@ -182,10 +187,11 @@ export function ScopeLine({
   narrowed: number;
   analyzedCommit?: string | null | undefined;
 }) {
+  const noun = filteredTotal === 1 ? "opportunity" : "opportunities";
   const scope =
     context === "all"
-      ? "opportunities"
-      : `${contextLabel(context as PerformanceExecutionContext).toLowerCase()} opportunities`;
+      ? noun
+      : `${contextLabel(context as PerformanceExecutionContext).toLowerCase()} ${noun}`;
   return (
     <p role="status" className="text-xs text-[var(--color-text-tertiary)]">
       <span className="tabular-nums">{filteredTotal.toLocaleString()}</span> {scope}

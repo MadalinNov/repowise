@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json as _json  # noqa: F401  — re-exported: a test patches answer._json.dumps
 import logging
 import time
@@ -94,6 +95,9 @@ from repowise.server.mcp_server._answer_pipeline import hydrate_hits as _hydrate
 from repowise.server.mcp_server._answer_pipeline import (
     retrieval_legs as _retrieval_legs,
 )
+from repowise.server.mcp_server._answer_pipeline import (
+    stamp_hybrid_rank as _stamp_hybrid_rank,
+)
 from repowise.server.mcp_server._entry_trace import (
     expand_via_entry_trace as _expand_via_entry_trace,
 )
@@ -120,12 +124,21 @@ from repowise.server.mcp_server.tool_answer.cache import (
     _serve_cached_answer,
     _write_answer_cache,
 )
+from repowise.server.mcp_server.tool_answer.callers import (
+    NO_EVIDENCE,
+    attach_graph_callers,
+    caller_evidence,
+    caller_lines,
+    is_caller_question,
+    is_impact_question,
+)
 from repowise.server.mcp_server.tool_answer.confidence import (
     _agreement_dominant,
     _grade_answer,
     _is_value_question,
     _retrieval_quality,
     dominance_reason,
+    uncovered_terms,
 )
 from repowise.server.mcp_server.tool_answer.config import (  # noqa: F401
     _GATED_EXCERPT_CHARS,
@@ -151,6 +164,11 @@ from repowise.server.mcp_server.tool_answer.evidence import (
     _first_resolvable_id,  # noqa: F401  — re-exported: imported from here by tests
     _is_readable_path,
     _repo_root,
+)
+from repowise.server.mcp_server.tool_answer.neighbors import (
+    attach_graph_neighbors,
+    lead_file,
+    neighbor_evidence,
 )
 from repowise.server.mcp_server.tool_answer.payload import (
     _apply_lean_high,  # noqa: F401  — backward-compatible helper re-export
@@ -178,6 +196,9 @@ from repowise.server.mcp_server.tool_answer.symbols import (
     _extract_value_answer,
     _hydrate_candidate_defines,
     _hydrate_symbols_for_hits,
+    drop_ruled_out_files,
+    lead_with_files,
+    place_named_files,
 )
 from repowise.server.mcp_server.tool_answer.synthesis import (
     _hash_answer_identity,
@@ -187,6 +208,7 @@ from repowise.server.mcp_server.tool_answer.synthesis import (
     _resolve_reasoning_for_answer,
     synthesize,
 )
+from repowise.server.mcp_server.tool_search_symbols import issue_files
 
 _log = logging.getLogger("repowise.mcp.answer")
 
@@ -199,6 +221,24 @@ if _MAX_CHARS_PER_HIT_EXCERPT < _GATED_EXCERPT_CHARS:
         f"while the fetch asks for {_GATED_EXCERPT_CHARS}. Raise "
         "_MAX_CHARS_PER_HIT_EXCERPT or lower _GATED_EXCERPT_CHARS."
     )
+
+
+async def _attach_neighbors(
+    payload: dict, *, wanted: bool, ctx, repo_id: str, hits: list[dict], exclude_spec
+) -> dict:
+    """``graph_neighbors`` for the file *payload* leads with; a failed lookup leaves it as is."""
+    if not wanted:
+        return payload
+    lead = lead_file(payload)
+    try:
+        async with get_session(ctx.session_factory) as session:
+            rows = await neighbor_evidence(
+                session, repo_id, lead, hits, exclude_spec, repo_root=_repo_root(ctx)
+            )
+    except Exception:
+        _log.warning("get_answer: graph neighbor lookup failed", exc_info=True)
+        return payload
+    return attach_graph_neighbors(payload, rows, lead)
 
 
 class _Retrieved(NamedTuple):
@@ -230,6 +270,7 @@ async def _run_retrieval_pipeline(
     # Drop excluded files right after hydration (which attaches target_path) so
     # they never enter ranking, citations, or fallback_targets.
     hits = filter_dicts_by_key(hits, "target_path", exclude_spec)
+    _stamp_hybrid_rank(hits)
 
     question_ids = _extract_question_identifiers(question)
 
@@ -260,6 +301,7 @@ async def _run_retrieval_pipeline(
                     hits,
                     repo_root=_anchor_root,
                     session_factory=ctx.session_factory,
+                    question=question,
                 )
     # Concept anchoring: a why/value question pinning a number to a behaviour
     # anchors the file whose source comment justifies that number.
@@ -299,6 +341,21 @@ async def _run_retrieval_pipeline(
     # Demote noise (decisions on non-why, test pages on non-test questions)
     # below real pages. Non-dropping; after anchoring, which never injects noise.
     hits = _demote_noise_hits(hits, question, is_why=_is_why_question(question))
+    # Files on a pasted stack trace lead; files defining a named identifier
+    # join just below the top three. No-op when the question has neither.
+    try:
+        issue = await issue_files(ctx, question)
+    except Exception:
+        _log.warning("get_answer: issue file lookup failed", exc_info=True)
+    else:
+        def _in_scope(paths: list[str]) -> list[str]:
+            return [p for p in paths if not scope or p.startswith(scope)]
+
+        if traced := _in_scope(issue.traced):
+            hits = lead_with_files(hits, traced)
+        if named := _in_scope(issue.named):
+            hits = place_named_files(hits, named)
+    hits = drop_ruled_out_files(hits, question)
     # The pre-cap ranking feeds ``candidates``: files below the synthesis cut
     # are still the best answer to "where do I look next".
     resolved_pool = list(hits)
@@ -335,9 +392,9 @@ async def get_answer(
     whose named mechanism is absent from the retrieved source is downgraded
     to medium (the rationale may be conflated). Low confidence returns
     best_guesses with one-line justifications instead of an empty answer.
-    retrieval_quality separately rates the retrieval that fed synthesis; when
-    it reads "weak" beside confidence=high, the note says what the confidence
-    rests on instead of the ranking, and that is the claim to trust.
+    confidence is the one trust signal: it also asks whether the top hit
+    covers what was asked. retrieval_quality, the rating of the retrieval
+    alone, is served only under ``include=["diagnostics"]``.
     When the answer names a function/method/class, ``symbol_bodies`` carries
     its full live body — read that instead of a follow-up get_symbol.
     ``episodes``, when present, is a dated fact recorded about this checkout
@@ -352,7 +409,8 @@ async def get_answer(
         question: developer question.
         scope: optional path-prefix filter (e.g. "src/pkg/").
         repo: usually omitted.
-        include: optional ``["evidence"]`` expanded projection.
+        include: optional ``["evidence"]`` expanded projection;
+            ``["diagnostics"]`` adds ``retrieval_quality``.
     """
     if repo == "all":
         return _unsupported_repo_all("get_answer")
@@ -412,6 +470,35 @@ async def get_answer(
     homonyms = retrieved.homonyms
     flow_paths = retrieved.flow_paths
 
+    # Caller questions get the graph's callers as evidence; every other
+    # question skips this without a query.
+    graph_callers = NO_EVIDENCE
+    if is_caller_question(question, question_ids):
+        try:
+            async with get_session(ctx.session_factory) as session:
+                graph_callers = await caller_evidence(
+                    session,
+                    repo_id,
+                    question,
+                    question_ids,
+                    hits,
+                    exclude_spec,
+                    repo_root=_repo_root(ctx),
+                )
+        except Exception:
+            _log.warning("get_answer: graph caller lookup failed", exc_info=True)
+
+    # Impact questions the caller lookup left unanswered get the users of the
+    # file the answer leads with, once that file is known.
+    _neighbors = functools.partial(
+        _attach_neighbors,
+        wanted=not graph_callers.rows and is_impact_question(question, question_ids),
+        ctx=ctx,
+        repo_id=repo_id,
+        hits=hits,
+        exclude_spec=exclude_spec,
+    )
+
     # Computed once, above the early returns (they rate retrieval too). The leg
     # status is read, not inferred from the capped `hits`; see _agreement_dominant.
     agreement_dominant = (
@@ -452,10 +539,13 @@ async def get_answer(
         ctx,
         repository,
         t0,
-        _retrieval_quality(hits, agreement_dominant),
+        _retrieval_quality(hits, agreement_dominant, question),
+        hits,
     )
     if union_payload is not None:
-        return _with_candidates(union_payload, resolved_pool)
+        return _with_candidates(
+            await _neighbors(attach_graph_callers(union_payload, graph_callers)), resolved_pool
+        )
 
     fallback_targets = [
         h["target_path"]
@@ -498,13 +588,18 @@ async def get_answer(
 
     if not always_synthesize and not dominant:
         return _with_candidates(
-            await build_abstain_payload(
-                question=question,
-                ctx=ctx,
-                hits=hits,
-                fallback_targets=fallback_targets,
-                repository=repository,
-                t0=t0,
+            await _neighbors(
+                attach_graph_callers(
+                    await build_abstain_payload(
+                        question=question,
+                        ctx=ctx,
+                        hits=hits,
+                        fallback_targets=fallback_targets,
+                        repository=repository,
+                        t0=t0,
+                    ),
+                    graph_callers,
+                )
             ),
             resolved_pool,
         )
@@ -517,7 +612,7 @@ async def get_answer(
     # Value-shaped question + a question-matched constant in the top hits →
     # the verbatim assignment line (read live by the hydrator) IS the answer.
     if _is_value_question(question) and question_ids:
-        extraction = _extract_value_answer(hits, question_ids)
+        extraction = _extract_value_answer(hits, question_ids, question)
         if extraction is not None:
             return _with_candidates(
                 build_value_payload(
@@ -547,7 +642,9 @@ async def get_answer(
             exclude_spec=exclude_spec,
             agreement_dominant=agreement_dominant,
             resolved_pool=resolved_pool,
+            graph_callers=graph_callers,
         )
+        payload = await _neighbors(payload)
         degraded_legs = _degraded_legs(_retrieval_legs())
         if degraded_legs:
             payload.setdefault("_meta", {})["retrieval_degraded"] = degraded_legs
@@ -576,6 +673,11 @@ async def get_answer(
     prelude = ""
     with contextlib.suppress(Exception):
         prelude = await _build_structured_prelude(hits, decisions, ctx, repo_id)
+    if graph_callers.rows:
+        graph_block = "Callers from the call graph:\n" + "\n".join(
+            f"- {line}" for line in caller_lines(graph_callers.rows)
+        )
+        prelude = f"{prelude}\n\n{graph_block}" if prelude else graph_block
 
     user_prompt = _USER_TEMPLATE.format(
         question=question.strip(),
@@ -605,13 +707,16 @@ async def get_answer(
 
     quotes = build_quotes(hits, answer_text)
 
-    # ``served_named_body``: the question-named symbol's live body is inlined, so
-    # the response is content-grounded even when synthesis hedges.
+    # ``served_named_body``: the question-named symbol's live body is inlined and
+    # carries what was asked, so the response is content-grounded even when
+    # synthesis hedges.
     repo_root = _repo_root(ctx)
     symbol_bodies, served_named_body = _build_symbol_bodies(
-        _gather_body_candidates(hits, answer_text), repo_root
+        _gather_body_candidates(hits, answer_text), repo_root, question=question, hits=hits
     )
 
+    # One coverage measurement for the grade and the retrieval rating.
+    uncovered = uncovered_terms(question, hits)
     grade = _grade_answer(
         question=question,
         question_ids=question_ids,
@@ -621,9 +726,10 @@ async def get_answer(
         symbol_bodies=symbol_bodies,
         served_named_body=served_named_body,
         dominance=dominance,
+        uncovered=uncovered,
     )
     confidence = grade.confidence
-    retrieval_quality = _retrieval_quality(hits, agreement_dominant)
+    retrieval_quality = _retrieval_quality(hits, agreement_dominant, question, uncovered)
 
     payload = await build_synthesized_payload(
         question=question,
@@ -642,6 +748,8 @@ async def get_answer(
         exclude_spec=exclude_spec,
     )
 
+    attach_graph_callers(payload, graph_callers)
+    await _neighbors(payload)
     if flow_paths:
         payload["flow_path"] = [" -> ".join(p) for p in flow_paths[:2]]
 
@@ -732,7 +840,8 @@ async def get_answer(
         question: Developer question.
         scope: Optional repository-relative path prefix.
         repo: Usually omitted; a workspace alias when needed.
-        include: Optional ``["evidence"]`` expanded projection.
+        include: Optional ``["evidence"]`` expanded projection;
+            ``["diagnostics"]`` adds ``retrieval_quality``.
     """
     return await _projected_get_answer(
         question=question,

@@ -48,6 +48,10 @@ Row shapes (the field names are the SQL columns):
 ``coverage``
     One mapping: ``files_measured``, ``ingested_at``, ``ingested_commit_sha``,
     ``partial``.
+``test_map``
+    One mapping of path to ``total`` (test files that reach it in the code
+    graph) and ``via`` (the walk), for :func:`reach_paths`; see
+    ``repowise.core.analysis.test_reachability.any_tests_reaching``.
 """
 
 from __future__ import annotations
@@ -60,14 +64,14 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from repowise.core.analysis.dead_code.risk_factors import REVIEW_ONLY_KINDS
-from repowise.core.analysis.finding_registry import excluded_types
+from repowise.core.analysis.finding_registry import excluded_types, is_served
 from repowise.core.analysis.health.fix_first import build_fix_first
 from repowise.core.analysis.health.models import primary_finding, split_by_origin
 from repowise.core.analysis.health.rows import field
 from repowise.core.analysis.health.scoring import HISTORY_CATEGORY, biomarker_category
 from repowise.core.author_identity import author_identity_key
 
-from .context import WEEK
+from .context import WEEK, build_context
 from .facts import (
     CoverageState,
     DeadFacts,
@@ -79,7 +83,7 @@ from .facts import (
     RepoFacts,
     SecretFacts,
 )
-from .rules.code import FIX_FIRST_ACTIONS
+from .rules.code import FIX_FIRST_ACTIONS, is_fragile
 from .rules.hygiene import PUBLIC_ENV_KIND, SECRET_KINDS
 
 logger = logging.getLogger(__name__)
@@ -202,7 +206,8 @@ def with_leads(files: Mapping[str, FileFacts], findings: Rows) -> dict[str, File
     by_path: dict[str, list] = defaultdict(list)
     for f in findings:
         path = field(f, "file_path")
-        if path in wanted and _open(f) and field(f, "biomarker_type") not in hidden:
+        biomarker = field(f, "biomarker_type")
+        if path in wanted and _open(f) and is_served("health", biomarker, path, hidden):
             by_path[path].append(f)
     out = dict(files)
     for path, found in by_path.items():
@@ -219,6 +224,39 @@ def with_leads(files: Mapping[str, FileFacts], findings: Rows) -> dict[str, File
                     reason=field(lead, "reason") or "",
                 ),
             )
+    return out
+
+
+def reach_paths(files: Mapping[str, FileFacts]) -> list[str]:
+    """The files whose test reach is worth a lookup: fragile, with no measured coverage.
+
+    Only these can become "add tests", so the graph walk stays keyed to a few.
+    The busy and fix bars depend on the files alone.
+    """
+    ctx = build_context(RepoFacts(anchor=None, files=files))
+    return [
+        p
+        for p, f in files.items()
+        if f.line_coverage_pct is None and is_fragile(f, ctx)
+    ]
+
+
+def with_test_reach(
+    files: Mapping[str, FileFacts], reaching: Mapping[str, Any]
+) -> dict[str, FileFacts]:
+    """``files`` with each :func:`reach_paths` file's reaching test files.
+
+    ``reaching`` maps a path to a row with ``total`` and ``via``; a looked-up
+    path it does not name has none.
+    """
+    out = dict(files)
+    for path in reach_paths(files):
+        row = reaching.get(path)
+        out[path] = replace(
+            out[path],
+            tests_reaching=int(field(row, "total") or 0) if row is not None else 0,
+            tests_reaching_via=field(row, "via") if row is not None else None,
+        )
     return out
 
 
@@ -249,9 +287,12 @@ def _authored_regression(row: Any) -> bool:
     )
 
 
-def _shown_code_shape(biomarker: Any, hidden: frozenset[str]) -> bool:
-    """A code-shape marker, not a history one, and not one the registry hides."""
-    return biomarker_category(biomarker) != HISTORY_CATEGORY and biomarker not in hidden
+def _shown_code_shape(row: Any, hidden: frozenset[str]) -> bool:
+    """A code-shape marker, not a history one, and one the registry serves."""
+    biomarker = field(row, "biomarker_type")
+    return biomarker_category(biomarker) != HISTORY_CATEGORY and is_served(
+        "health", biomarker, field(row, "file_path"), hidden
+    )
 
 
 def _recent_candidates(
@@ -268,7 +309,7 @@ def _recent_candidates(
             continue
         if _is_test(field(f, "file_path"), files):
             continue
-        if _shown_code_shape(field(f, "biomarker_type"), hidden):
+        if _shown_code_shape(f, hidden):
             out.append((f, at))
     return out
 
@@ -280,23 +321,21 @@ def build_recent(
     open_findings: Rows,
     files: Mapping[str, FileFacts],
 ) -> dict[str, Any]:
-    """Findings a commit in the last week wrote that are still open."""
+    """Findings a commit in the last week wrote that are still open and serious,
+    as the open finding reads today."""
     if week is None:
         return {}
     candidates = _recent_candidates(rows, week=week, files=files)
     if not candidates:
         return {"recent_findings": ()}
-    open_keys = {
-        (field(h, "file_path"), field(h, "biomarker_type"), field(h, "function_name"))
-        for h in open_findings
-        if _open(h)
-    }
+    serious = _serious_open(open_findings)
     recent = []
     seen: set[tuple[str, str, str | None]] = set()
     for f, at in sorted(candidates, key=lambda c: c[1], reverse=True):
         key = (field(f, "file_path"), field(f, "biomarker_type"), field(f, "symbol"))
-        # Still open, and counted once however many commits touched it.
-        if key not in open_keys or key in seen:
+        # Still serious today, and counted once however many commits touched it.
+        now = serious.get(key)
+        if now is None or key in seen:
             continue
         seen.add(key)
         recent.append(
@@ -307,13 +346,41 @@ def build_recent(
                 file_path=field(f, "file_path"),
                 symbol=field(f, "symbol"),
                 biomarker=field(f, "biomarker_type"),
-                severity=field(f, "severity"),
+                severity=field(now, "severity"),
                 change_kind=field(f, "change_kind"),
-                line=field(f, "line_start"),
-                reason=field(f, "reason") or "",
+                line=field(now, "line_start"),
+                reason=field(now, "reason") or "",
             )
         )
     return {"recent_findings": tuple(recent)}
+
+
+def _serious_open(open_findings: Rows) -> dict[tuple[str, str, str | None], Any]:
+    """The worst open critical/high finding per (file, marker, function).
+
+    A commit's row records the finding as that commit left it; the open row
+    is what is true today, so it decides whether the finding still counts and
+    what the action says about it. Ties go to the higher impact, then the
+    earlier line, then the reason, so the pick does not hang on row order.
+    """
+
+    def worse(h: Any) -> tuple:
+        return (
+            field(h, "severity") == "critical",
+            field(h, "health_impact") or 0.0,
+            -(field(h, "line_start") or 0),
+            field(h, "reason") or "",
+        )
+
+    out: dict[tuple[str, str, str | None], Any] = {}
+    for h in open_findings:
+        if not _open(h) or field(h, "severity") not in ("critical", "high"):
+            continue
+        key = (field(h, "file_path"), field(h, "biomarker_type"), field(h, "function_name"))
+        held = out.get(key)
+        if held is None or worse(h) > worse(held):
+            out[key] = h
+    return out
 
 
 def build_fix_first_store(rows: Mapping[str, Rows]) -> dict[str, Any]:
@@ -375,7 +442,7 @@ def build_dead(rows: Rows, files: Mapping[str, FileFacts]) -> dict[str, Any]:
             for r in rows
             if _open(r)
             and field(r, "safe_to_delete")
-            and field(r, "kind") not in skipped
+            and is_served("dead_code", field(r, "kind"), field(r, "file_path"), skipped)
             and not _is_test(field(r, "file_path"), files)
             and not _test_path(field(r, "file_path"))
         )
@@ -429,12 +496,15 @@ def build_repo_facts(
     dead_code: Rows | None = None,
     decisions: Mapping[str, Any] | None = None,
     coverage: Mapping[str, Any] | None = None,
+    test_map: Mapping[str, Any] | None = None,
+    history_commits: int | None = None,
     unavailable: Mapping[str, str] | None = None,
     absent_reason: str = ABSENT,
 ) -> RepoFacts:
     """`RepoFacts` from rows (shapes in the module docstring).
 
-    ``anchor`` is the newest commit's time and ``head_sha`` its sha. A store
+    ``anchor`` is the newest commit's time and ``head_sha`` its sha;
+    ``history_commits`` is how many commits the index holds. A store
     passed as ``None`` is reported unavailable with ``absent_reason``; one that
     fails to build is reported the same way, so it costs only its own rules.
     ``unavailable`` names stores the caller withholds, with the reason; they
@@ -443,7 +513,7 @@ def build_repo_facts(
     anchor = _when(anchor)
     since = (anchor - QUARTER) if anchor else None
     week = (anchor - WEEK) if anchor else None
-    values: dict[str, Any] = {"anchor": anchor}
+    values: dict[str, Any] = {"anchor": anchor, "history_commits": history_commits}
     missing: dict[str, str] = {}
     health_findings = list(health_findings)
 
@@ -463,6 +533,8 @@ def build_repo_facts(
         return out
 
     build("files", files, file_store)
+    if "files" in values:
+        build("test_map", test_map, lambda m: {"files": with_test_reach(values["files"], m)})
     known_files: Mapping[str, FileFacts] = values.get("files") or {}
     build("authors", authors, lambda rows: build_authors(rows, since=since))
     build(
@@ -499,5 +571,7 @@ __all__ = [
     "build_repo_facts",
     "build_secrets",
     "lead_paths",
+    "reach_paths",
     "with_leads",
+    "with_test_reach",
 ]

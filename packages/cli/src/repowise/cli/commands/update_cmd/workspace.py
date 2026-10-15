@@ -62,6 +62,7 @@ def _workspace_update(
     concurrency: int = 10,
     no_cost_tracking: bool = False,
     progress: str = "rich",
+    include_working_tree: bool = False,
 ) -> None:
     """Update stale repos in a workspace.
 
@@ -78,12 +79,14 @@ def _workspace_update(
     """
     from repowise.cli.helpers import load_state
     from repowise.core.docs_mode import resolve_docs_mode
+    from repowise.core.ingestion.change_detector import has_working_tree_changes
     from repowise.core.repo_config import config_fingerprint
     from repowise.core.workspace import (
         check_repo_staleness,
         reconcile_repo_head_commit,
         update_workspace,
     )
+    from repowise.core.workspace.update import sync_workspace_state_from_disk
 
     from .mode import _resolve_index_only_mode
 
@@ -101,6 +104,11 @@ def _workspace_update(
     console.print(f"[bold]repowise update[/bold] \u2014 workspace: {ws_root.name}")
     console.print()
 
+    # Staleness reads the workspace config, and an "up to date" repo has its DB
+    # row stamped from live HEAD below. Read each repo's state.json first, as
+    # update_workspace does, so a config ahead of state.json cannot stamp the
+    # row past the commit state.json names.
+    sync_workspace_state_from_disk(ws_root, ws_config)
     stale_count = 0
     up_to_date_count = 0
     up_to_date_repos: list[tuple[Path, str]] = []
@@ -125,10 +133,16 @@ def _workspace_update(
             )
         )
         is_stale = is_stale or config_stale
+        dirty = bool(
+            indexed and not is_stale and include_working_tree and has_working_tree_changes(abs_path)
+        )
+        is_stale = is_stale or dirty
         if not indexed:
             status = "[dim]not indexed[/dim]"
         elif config_stale and not behind:
             status = "[yellow]config changed[/yellow]"
+        elif dirty:
+            status = "[yellow]uncommitted changes[/yellow]"
         elif is_stale:
             status = f"[yellow]{behind} new commit(s)[/yellow]"
         else:
@@ -218,6 +232,7 @@ def _workspace_update(
             concurrency=concurrency,
             no_cost_tracking=no_cost_tracking,
             progress=progress,
+            include_working_tree=include_working_tree,
         )
         return
 
@@ -232,6 +247,7 @@ def _workspace_update(
             ws_config,
             repo_filter=repo_alias,
             dry_run=False,
+            include_working_tree=include_working_tree,
             on_repo_start=_on_start,
             on_repo_done=_print_repo_result,
         )
@@ -358,6 +374,7 @@ def _workspace_docs_update(
     concurrency: int,
     no_cost_tracking: bool,
     progress: str,
+    include_working_tree: bool = False,
 ) -> None:
     """Update a workspace where at least one stale repo wants docs.
 
@@ -407,6 +424,7 @@ def _workspace_docs_update(
                 only_aliases=core_aliases,
                 run_hooks=False,
                 dry_run=False,
+                include_working_tree=include_working_tree,
                 on_repo_start=_on_start,
                 on_repo_done=_print_repo_result,
             )
@@ -444,6 +462,7 @@ def _workspace_docs_update(
                 # corrupt it. The per-repo rich output goes to stderr there.
                 progress="rich",
                 skip_cross_repo_hooks=True,
+                include_working_tree=include_working_tree,
             )
         except Exception as exc:
             docs_failed += 1
@@ -571,6 +590,8 @@ def _refresh_workspace_editor_project_files(
     from repowise.cli.editor_integrations.defaults import get_default_project_file_overrides
     from repowise.cli.editor_setup import EditorSetupOptions, refresh_editor_project_files
 
+    from .persistence import refresh_read_snapshots
+
     options: EditorSetupOptions | None = None
     if agents_md is not None:
         options = EditorSetupOptions(
@@ -582,6 +603,7 @@ def _refresh_workspace_editor_project_files(
         repo_path = (ws_root / entry.path).resolve()
         if not (repo_path / ".repowise").is_dir():
             continue
+        refresh_read_snapshots(repo_path)
         try:
             refresh_editor_project_files(console, repo_path, options=options)
         except Exception as exc:

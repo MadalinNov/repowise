@@ -23,6 +23,8 @@ export interface ActionContext {
   fix_commits_90d: number;
   busy_threshold: number;
   coverage: "measured" | "stale" | "unknown";
+  /** The index holds too few commits for history-driven rules to rank by. */
+  history_too_short?: boolean;
 }
 
 export interface ActionDetail {
@@ -83,6 +85,8 @@ export interface ActionsResponse {
   week_start: string | null;
   context: ActionContext;
   horizons: Record<string, ActionHorizon>;
+  /** Where things stand in each horizon, in one sentence. */
+  summary: Record<string, string>;
   rules: ActionRuleStatus[];
   unavailable: Record<string, string>;
 }
@@ -91,28 +95,50 @@ export interface ActionsResponse {
 export interface ActiveProviderSelection {
   provider?: string | null;
   model?: string | null;
+  base_url?: string | null;
+  provenance?: SelectionProvenance;
+  base_url_unconfirmed?: boolean;
+  input_cost_per_1k?: number | null;
+  output_cost_per_1k?: number | null;
+  embedder?: string | null;
 }
 
 export interface AgentPromptResponse {
   flavor: "generic" | "claude-code" | "claude-code-mcp" | "cursor";
   text: string;
+  preview?: string | null;
 }
 
-/** One month of agent-vs-human commit volume. */
+/** One month of commits by attribution label. */
 export interface AgentTrendBucket {
+  total_commits?: number;
+  agent_commits?: number;
+  human_attested_commits?: number;
+  unknown_commits?: number;
+  coverage_pct?: number | null;
+  agent_pct_of_covered?: number | null;
+  suppressed_reason?: string | null;
   month: string;
-  total_commits: number;
-  agent_commits: number;
-  agent_pct: number;
   tier_counts?: Record<string, unknown>;
 }
 
-/** Monthly agent-share trend across the indexed commit window. */
+/**
+ * Monthly attribution trend across the indexed commit window.
+ *
+ * ``enabled`` is false, with every figure empty, when AI attribution is off
+ * for the repository.
+ */
 export interface AgentTrendResponse {
-  buckets: AgentTrendBucket[];
-  total_commits: number;
-  agent_commits: number;
-  agent_pct: number;
+  total_commits?: number;
+  agent_commits?: number;
+  human_attested_commits?: number;
+  unknown_commits?: number;
+  coverage_pct?: number | null;
+  agent_pct_of_covered?: number | null;
+  suppressed_reason?: string | null;
+  enabled?: boolean;
+  coverage_floor_pct: number;
+  buckets?: AgentTrendBucket[];
   agent_names?: Record<string, unknown>[];
 }
 
@@ -345,6 +371,37 @@ export interface CallersCalleesResponse {
   relations?: SymbolRelationGroup[];
 }
 
+/** An entity a card or view points at. Never a URL; the renderer resolves it. */
+export interface CardRef {
+  type: "repo" | "file" | "symbol" | "module" | "component" | "commit" | "change" | "decision";
+  id: string;
+  start_line?: number | null;
+  end_line?: number | null;
+}
+
+export interface ChangeAuthor {
+  name: string;
+  email: string;
+}
+
+/** The evidence checklist (``repowise.core.changes.evidence``), versioned. */
+export interface ChangeEvidence {
+  schema_version: number;
+  change_id?: string | null;
+  revspec?: string | null;
+  generated_at: string;
+  index_commit?: string | null;
+  items: EvidenceItem[];
+}
+
+/** Status counts of a change's kept checklist; never builds one. */
+export interface ChangeEvidenceSummary {
+  generated_at: string;
+  ok: number;
+  attention: number;
+  unknown: number;
+}
+
 /** The Kamei change-shape features the risk model scores. */
 export interface ChangeFeaturesResponse {
   la: number;
@@ -356,10 +413,103 @@ export interface ChangeFeaturesResponse {
   exp: number | null;
 }
 
+export interface ChangeFile {
+  path: string;
+  added: number;
+  deleted: number;
+}
+
+/** Forge facts from a metadata source; ``None`` means unknown. */
+export interface ChangeForgeMetadata {
+  source?: string | null;
+  reviewers?: string[] | null;
+  approvals?: number | null;
+  labels?: string[] | null;
+  linked_issues?: string[] | null;
+}
+
+/** ``pr`` | ``change_id`` | ``merge`` | ``commit``, first that applies. */
+export interface ChangeIdentity {
+  kind: string;
+  value: string;
+}
+
+export interface ChangeListItem {
+  schema_version: number;
+  id: string;
+  identity: ChangeIdentity;
+  shape: string;
+  forge: string;
+  forge_ref?: string | null;
+  title: string;
+  merged_at?: string | null;
+  head_sha: string;
+  author: ChangeAuthor;
+  commit_count: number;
+  files_changed: number;
+  lines_added: number;
+  lines_deleted: number;
+  category: string;
+  provenance?: ChangeProvenance | null;
+  evidence_summary?: ChangeEvidenceSummary | null;
+}
+
+export interface ChangeListResponse {
+  items: ChangeListItem[];
+  total: number;
+  limit: number;
+  offset: number;
+  attribution: boolean;
+  checklists_built?: ChecklistsBuilt | null;
+}
+
+/** Three-state AI provenance over the change's commits, with its coverage. */
+export interface ChangeProvenance {
+  label: string;
+  agent_commits: number;
+  human_attested_commits: number;
+  unknown_commits: number;
+  coverage?: number | null;
+}
+
+export interface ChangeRecord {
+  schema_version: number;
+  id: string;
+  identity: ChangeIdentity;
+  shape: string;
+  forge: string;
+  forge_ref?: string | null;
+  title: string;
+  merged_at?: string | null;
+  head_sha: string;
+  author: ChangeAuthor;
+  commit_count: number;
+  files_changed: number;
+  lines_added: number;
+  lines_deleted: number;
+  category: string;
+  provenance?: ChangeProvenance | null;
+  commits: string[];
+  files: ChangeFile[];
+  metadata: ChangeForgeMetadata;
+  evidence?: ChangeEvidence | null;
+  evidence_building?: boolean;
+}
+
 export interface ChangelogEntryModel {
   version: string;
   label?: string | null;
+  summary?: string;
+  highlights?: ChangelogHighlightModel[];
+  stats?: ReleaseStatsModel | null;
   sections: ChangelogSectionModel[];
+}
+
+export interface ChangelogHighlightModel {
+  id: string;
+  title: string;
+  blurb: string;
+  href?: string | null;
 }
 
 export interface ChangelogResponse {
@@ -391,6 +541,29 @@ export interface ChatArtifactEnvelope {
   created_at?: string | null;
 }
 
+/** A file a tool result cited, and that result's ``artifact_id``. */
+export interface ChatCitation {
+  file_path: string;
+  symbol_name?: string | null;
+  start_line?: number | null;
+  end_line?: number | null;
+  artifact_id?: string | null;
+  ref?: CardRef | null;
+}
+
+/**
+ * A number the answer states. Offsets are UTF-16 units into ``answer``;
+ * a verified figure carries the ``artifact_id`` of the result holding it.
+ */
+export interface ChatFigure {
+  text: string;
+  start: number;
+  end: number;
+  verified: boolean;
+  artifact_id?: string | null;
+  derived?: boolean;
+}
+
 export interface ChatMessageResponse {
   id: string;
   conversation_id: string;
@@ -415,6 +588,53 @@ export interface ChatRequest {
   context?: ChatPageContext | null;
 }
 
+export interface ChatSessionMessageRequest {
+  message: string;
+  idempotency_key?: string | null;
+  context?: ChatPageContext | null;
+  stream?: boolean;
+  provider?: string | null;
+  model?: string | null;
+}
+
+/** Open a session, or resume the one ``(namespace, external_ref)`` names. */
+export interface ChatSessionOpenRequest {
+  repo_id: string;
+  scope?: "repo" | "workspace";
+  namespace?: string;
+  external_ref?: string | null;
+  title?: string | null;
+  policy?: ChatSessionPolicyRequest | null;
+}
+
+/**
+ * Limits a caller asks for. Each may only narrow the server's default
+ * session policy; a wider value is refused.
+ */
+export interface ChatSessionPolicyRequest {
+  tool_allowlist?: string[] | null;
+  max_tool_loops?: number | null;
+  max_turns?: number | null;
+  max_output_tokens?: number | null;
+  max_turn_tokens?: number | null;
+  max_session_tokens?: number | null;
+  audience?: "engineer" | "business" | null;
+}
+
+export interface ChatSessionResponse {
+  id: string;
+  repository_id: string;
+  title: string;
+  scope: "repo" | "workspace";
+  namespace?: string | null;
+  external_ref?: string | null;
+  created?: boolean;
+  policy?: Record<string, unknown>;
+  turns?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+}
+
 /**
  * One composer chip. ``source`` lets a client rank a measured question
  * above the static tier it already ships.
@@ -431,6 +651,47 @@ export interface ChatSuggestion {
  */
 export interface ChatSuggestionsResponse {
   suggestions?: ChatSuggestion[];
+}
+
+export interface ChatToolTraceEntry {
+  name: string;
+  summary: string;
+  ok: boolean;
+  basis: string;
+  origin?: string | null;
+}
+
+export interface ChatTurnResultResponse {
+  conversation_id: string;
+  message_id?: string | null;
+  user_message_id?: string | null;
+  answer: string;
+  stop_reason: "answered" | "loop_cap" | "token_budget" | "turn_budget" | "refused" | "cancelled" | "error";
+  provider: string;
+  model: string;
+  citations?: ChatCitation[];
+  cards?: Record<string, unknown>[];
+  views?: Record<string, unknown>[];
+  figures?: ChatFigure[];
+  diagnostics?: Record<string, number>;
+  tool_trace?: ChatToolTraceEntry[];
+  follow_ups?: ChatSuggestion[];
+  usage?: ChatTurnUsage;
+  error?: string | null;
+  replayed?: boolean;
+}
+
+/** Null token counts mean the provider reported none. */
+export interface ChatTurnUsage {
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  model_calls?: number;
+}
+
+/** How many of the changes a list's filters match keep an evidence checklist. */
+export interface ChecklistsBuilt {
+  built: number;
+  changes: number;
 }
 
 /**
@@ -466,6 +727,17 @@ export interface ClaudeMdResponse {
   generated_at: string;
   repo_name: string;
   sections?: string[];
+}
+
+export interface CloudEvent {
+  specversion: string;
+  id: string;
+  source: string;
+  type: string;
+  time: string;
+  datacontenttype: string;
+  subject?: string | null;
+  data: Record<string, unknown>;
 }
 
 /**
@@ -512,6 +784,7 @@ export interface CommitDetailResponse {
   agent_name?: string | null;
   agent_autonomy_tier?: number | null;
   agent_confidence?: string | null;
+  attribution?: string | null;
   drivers?: RiskDriverResponse[];
   agent_channel?: string | null;
   files?: CommitFileResponse[];
@@ -622,6 +895,7 @@ export interface CommitResponse {
   agent_name?: string | null;
   agent_autonomy_tier?: number | null;
   agent_confidence?: string | null;
+  attribution?: string | null;
 }
 
 /**
@@ -636,7 +910,9 @@ export interface CommitStatsResponse {
   total_commits: number;
   high_priority_count: number;
   fix_commit_count: number;
-  agent_commit_count: number;
+  agent_commit_count?: number | null;
+  agent_pct_of_covered?: number | null;
+  attribution_coverage_pct?: number | null;
   avg_entropy: number;
   risk_histogram?: RiskHistogramBucket[];
   moderate_cut?: number | null;
@@ -868,6 +1144,7 @@ export interface DeadCodeFindingResponse {
   last_commit_at: string | null;
   commit_count_90d: number;
   verification?: string | null;
+  preview?: string | null;
 }
 
 export interface DeadCodeGraphNodeResponse {
@@ -906,6 +1183,8 @@ export interface DeadCodeSummaryResponse {
   deletable_lines: number;
   total_lines: number;
   by_kind: Record<string, unknown>;
+  analyzed_at?: string | null;
+  gated?: Record<string, unknown>;
 }
 
 /** A link from a decision to a governed file or module. */
@@ -1266,6 +1545,13 @@ export interface EgoGraphResponse {
   outbound_count: number;
 }
 
+/** One registered embedder, as the settings picker renders it. */
+export interface EmbedderEntry {
+  id: string;
+  env_vars?: string[];
+  semantic?: boolean;
+}
+
 /**
  * Counts by tier and by kind, from a grouped read of the same filters.
  *
@@ -1324,6 +1610,31 @@ export interface EpisodeSummary {
   birth_at: string | null;
   last_seen_at: string | null;
   still_true?: string | null;
+}
+
+export interface EventListResponse {
+  events: CloudEvent[];
+  snapshot_runs?: number;
+  empty_reason?: "baseline_only" | "no_match" | "nothing_moved" | null;
+  empty_note?: string | null;
+}
+
+/** One checklist row: what was found, whether it needs a look, how it is known. */
+export interface EvidenceItem {
+  kind: string;
+  label: string;
+  status: "ok" | "attention" | "unknown";
+  basis: "measured" | "inferred" | "declared" | "unresolved";
+  value?: unknown;
+  details: Record<string, unknown>[];
+  source: string;
+  line?: EvidenceLine | null;
+}
+
+/** An item's value as a message key and its parameters, for a client to word. */
+export interface EvidenceLine {
+  key: string;
+  params: Record<string, unknown>;
 }
 
 /** The top-ranked evidence row, slimmed for list rows. */
@@ -1556,6 +1867,7 @@ export interface FixFirstQueueResponse {
   by_improves: Record<string, number>;
   model_version: number;
   basis: Record<string, string | null>;
+  counts: QueueCounts;
 }
 
 export interface FixGain {
@@ -1607,6 +1919,7 @@ export interface FixItem {
   source: FixSource;
   next_call: ActionCommand;
   why_ranked?: FixRankFact[];
+  value?: number | null;
 }
 
 export interface FixRankFact {
@@ -1633,6 +1946,9 @@ export interface FixStep {
   file_path: string;
   line?: number | null;
   mechanical?: boolean;
+  signature?: string | null;
+  call?: string | null;
+  command?: string | null;
 }
 
 export interface FixTarget {
@@ -1652,6 +1968,7 @@ export interface FixTotals {
   eligible?: number;
   shown?: number;
   excluded?: Record<string, number>;
+  dormant?: number;
 }
 
 export interface FixVerify {
@@ -1659,9 +1976,10 @@ export interface FixVerify {
   tests_total: number;
   command: string | null;
   basis: "measured" | "inferred" | "unknown";
+  prerequisite?: string | null;
 }
 
-/** Optional per-call overrides for the enrichment provider/model. */
+/** Optional per-call provider/model overrides, as chat accepts. */
 export interface GenerateCodeRequest {
   provider?: string | null;
   model?: string | null;
@@ -1757,9 +2075,11 @@ export interface GitMetadataResponse {
   commit_count_capped?: boolean;
   original_path?: string | null;
   test_gap?: boolean | null;
-  agent_commit_count?: number;
+  agent_commit_count?: number | null;
   agent_authored_pct?: number | null;
-  agent_tier_counts?: Record<string, unknown>;
+  agent_tier_counts?: Record<string, unknown> | null;
+  attribution_coverage?: number | null;
+  agent_share_suppressed?: string | null;
 }
 
 export interface GitSummaryResponse {
@@ -1876,6 +2196,7 @@ export interface HealthFindingResponse {
   dimension?: string;
   verification?: string | null;
   lower_priority?: string | null;
+  preview?: string | null;
 }
 
 /**
@@ -1899,6 +2220,7 @@ export interface HealthFindingWithSymbolResponse {
   dimension?: string;
   verification?: string | null;
   lower_priority?: string | null;
+  preview?: string | null;
   symbol_id?: string | null;
 }
 
@@ -1975,6 +2297,7 @@ export interface HealthWorkItem {
   biomarkers?: string[];
   effort_bucket: string;
   impact_per_effort: number;
+  preview?: string | null;
 }
 
 export interface HealthWorkQueueResponse {
@@ -2251,6 +2574,10 @@ export interface NextAction {
   surface: string;
   effort: "S" | "M" | "L";
   confidence: "high" | "medium";
+  /** 0-4: the Fix first value band, or what the severity says. */
+  value?: number;
+  /** Value x confidence / effort: the order inside a tier. */
+  priority?: number;
   done_when: string;
   command?: string | null;
   marker?: string | null;
@@ -2272,20 +2599,6 @@ export interface NodeSearchResult {
 /** Acknowledgement for a mutation with nothing else to report. */
 export interface OkResponse {
   ok?: boolean;
-}
-
-/**
- * How much coding-agent activity lands on the files this person owns.
- *
- * Aggregated from the per-file agent-provenance rollup (GitMetadata) over
- * the owner's primary-owned files — agent identity per commit lives on the
- * commits surface, the per-file rollup only carries counts and tiers.
- */
-export interface OwnerAgentCollab {
-  files_with_agent_commits: number;
-  agent_commit_count: number;
-  agent_share_pct: number | null;
-  tier_counts?: Record<string, unknown>;
 }
 
 export interface OwnerCoAuthor {
@@ -2316,6 +2629,7 @@ export interface OwnerListEntry {
   dead_code_files_owned: number;
   dead_code_lines_owned: number;
   commit_count_90d: number | null;
+  commit_count_90d_at_least?: number | null;
   last_commit_at: string | null;
   bus_factor_risk_files: number;
 }
@@ -2337,6 +2651,7 @@ export interface OwnerProfileResponse {
   dead_code_files_owned: number;
   dead_code_lines_owned: number;
   commit_count_90d: number | null;
+  commit_count_90d_at_least?: number | null;
   last_commit_at: string | null;
   first_commit_at: string | null;
   bus_factor_risk_files: number;
@@ -2348,7 +2663,6 @@ export interface OwnerProfileResponse {
   co_authors: OwnerCoAuthor[];
   co_authors_total?: number;
   commit_categories: Record<string, unknown>;
-  agent_collab?: OwnerAgentCollab | null;
 }
 
 export interface OwnershipEntry {
@@ -2357,6 +2671,63 @@ export interface OwnershipEntry {
   owner_pct: number | null;
   file_count: number;
   is_silo: boolean;
+}
+
+export interface PackageUsageComponent {
+  name: string;
+  files: number;
+  owners: string[];
+}
+
+export interface PackageUsageDeclaration {
+  package_key: string;
+  version?: string | null;
+  declared_in: string;
+  dev?: boolean;
+}
+
+/** One module the file imports and how it was matched to the package. */
+export interface PackageUsageModule {
+  name: string;
+  mapping: "declared" | "inferred";
+}
+
+export interface PackageUsageReachability {
+  state: string;
+  basis: string;
+}
+
+/** Where one package is imported: sites, components, owner teams, reachability. */
+export interface PackageUsageResponse {
+  package: string;
+  ecosystem?: string | null;
+  declared: PackageUsageDeclaration[];
+  summary: PackageUsageSummary;
+  sites: PackageUsageSite[];
+  components: PackageUsageComponent[];
+  method: Record<string, string>;
+  note?: string | null;
+}
+
+/** One file importing the package. */
+export interface PackageUsageSite {
+  path: string;
+  modules: PackageUsageModule[];
+  symbols: string[];
+  mapping: "declared" | "inferred";
+  line?: number | null;
+  statement?: string | null;
+  component?: string | null;
+  owners: string[];
+  owner_counts?: Record<string, number> | null;
+  reachability: PackageUsageReachability;
+}
+
+export interface PackageUsageSummary {
+  files: number;
+  components: number;
+  reachability: Record<string, number>;
+  inferred_files: number;
 }
 
 /** PATCH body for /lookup/notes. ``None`` clears the note. */
@@ -2466,7 +2837,7 @@ export interface PatchCoverageBranches {
 
 export interface PatchCoverageFile {
   file_path: string;
-  status: "measured" | "not_in_report" | "no_line_data" | "no_coverable_changes";
+  status: "measured" | "not_in_report" | "no_line_data" | "no_coverable_changes" | "stale_file";
   changed_line_count: number;
   coverable_line_count: number;
   covered_line_count: number;
@@ -2484,6 +2855,7 @@ export interface PatchCoverageFileCounts {
   not_in_report: number;
   no_line_data: number;
   no_coverable_changes: number;
+  stale_file: number;
   out_of_scope: number;
 }
 
@@ -2600,6 +2972,36 @@ export interface PatchCoverageTestHint {
   total: number;
 }
 
+/** A function's stored size measures; an absent one was not measured. */
+export interface PlanMeasuresResponse {
+  ccn?: number | null;
+  nloc?: number | null;
+  params?: number | null;
+}
+
+/**
+ * What happened to a plan the index resolved as no longer detected.
+ *
+ * ``applied`` means the measures are consistent with the plan being applied:
+ * the target shed at least half the predicted decision points and a function
+ * fitting the extracted slice appeared beside it.
+ */
+export interface PlanPayoffResponse {
+  outcome: string;
+  resolved_commit?: string | null;
+  resolved_at?: string | null;
+  before?: PlanMeasuresResponse | null;
+  after?: PlanMeasuresResponse | null;
+  realised?: Record<string, number> | null;
+  new_symbol?: string | null;
+}
+
+export interface PlanRiskResponse {
+  kind: string;
+  text: string;
+  ref?: string | null;
+}
+
 /**
  * What the map is counting.
  *
@@ -2624,11 +3026,36 @@ export interface ProviderEntry {
   models?: string[];
   default_model?: string | null;
   configured?: boolean;
+  requires_key?: boolean;
+  accepts_base_url?: boolean;
+  local_server?: boolean;
+  env_vars?: string[];
+  setup_hint?: string;
+}
+
+export interface ProviderModelEntry {
+  id: string;
+  label?: string | null;
+}
+
+/**
+ * Models a provider offers, newest-looking first after the default.
+ *
+ * ``source`` is ``live`` when the provider listed them and ``catalog`` when
+ * the built-in list stands in, with ``error`` saying why.
+ */
+export interface ProviderModelsResponse {
+  models: ProviderModelEntry[];
+  source: "live" | "catalog";
+  default_model: string;
+  error?: string | null;
 }
 
 export interface ProviderStatusResponse {
   active: ActiveProviderSelection;
   providers?: ProviderEntry[];
+  flag_only_providers?: string[];
+  embedders?: EmbedderEntry[];
 }
 
 /**
@@ -2658,6 +3085,16 @@ export interface PublishResponse {
   repo?: string | null;
 }
 
+export interface QueueCounts {
+  inventory?: number;
+  in_scope?: number;
+  eligible?: number;
+  due?: number;
+  shown?: number;
+  excluded?: Record<string, number>;
+  gated?: number;
+}
+
 /** What the ``fix_first`` scope leaves out of a page's filtered set. */
 export interface RefactoringHiddenCounts {
   total?: number;
@@ -2676,6 +3113,8 @@ export interface RefactoringOpportunitiesResponse {
   ignored_arguments?: Record<string, string> | null;
   scope?: "fix_first" | "all";
   hidden?: RefactoringHiddenCounts | null;
+  counts?: QueueCounts | null;
+  gated?: Record<string, Record<string, unknown>> | null;
 }
 
 /**
@@ -2698,6 +3137,7 @@ export interface RefactoringOpportunityDetailResponse {
   next_actions?: Record<string, unknown>[];
   plans?: Record<string, unknown>[] | null;
   ordering_note?: string | null;
+  preview?: string | null;
 }
 
 /** What one opportunity-level triage decision wrote. */
@@ -2714,14 +3154,39 @@ export interface RefactoringOpportunityStatusUpdate {
   status: string;
 }
 
-/** Bounded product page; the legacy targets response remains unpaged. */
-export interface RefactoringPlanPageResponse {
-  items: RefactoringPlanResponse[];
-  total: number;
-  has_more: boolean;
-  next_offset: number | null;
-  summary: RefactoringSummary;
-  structural_leads: RefactoringPlanResponse[];
+/**
+ * One plan read alone: what other layers say about its target. Lists stay
+ * on :class:`RefactoringPlanResponse` and never carry these; both are absent
+ * on a plan that was never checked.
+ */
+export interface RefactoringPlanDetailResponse {
+  id: string;
+  refactoring_type: string;
+  file_path: string;
+  target_symbol: string;
+  line_start?: number | null;
+  line_end?: number | null;
+  plan?: Record<string, unknown>;
+  evidence?: Record<string, unknown>;
+  impact_delta?: number;
+  effort_bucket?: string;
+  blast_radius?: Record<string, unknown>;
+  confidence?: string;
+  source_biomarker?: string;
+  benefit?: number;
+  leverage?: number;
+  cost?: number;
+  risk?: number;
+  rank_score?: number;
+  dependents?: number;
+  file_nloc?: number;
+  file_weighted_deficit?: number;
+  validation?: Record<string, unknown>;
+  preview?: string | null;
+  governed_by?: string[] | null;
+  risks?: PlanRiskResponse[] | null;
+  recipe?: Record<string, unknown> | null;
+  payoff?: PlanPayoffResponse | null;
 }
 
 /**
@@ -2751,6 +3216,7 @@ export interface RefactoringPlanResponse {
   file_nloc?: number;
   file_weighted_deficit?: number;
   validation?: Record<string, unknown>;
+  preview?: string | null;
 }
 
 /** What one plan-level triage decision wrote. */
@@ -2768,11 +3234,21 @@ export interface RefactoringRollupResponse {
   directive?: Record<string, unknown>;
 }
 
-/** The opt-in code-generation switches, mirrored from ``refactoring.llm``. */
+/**
+ * The code-generation switch plus the model it will use.
+ *
+ * ``provider`` / ``model`` are read-only: they come from the same resolver
+ * chat uses, so the user configures a model once. Never carries a key.
+ */
 export interface RefactoringSettings {
   enabled?: boolean;
   provider?: string | null;
   model?: string | null;
+}
+
+/** The one writable field, ``refactoring.llm.enabled``. */
+export interface RefactoringSettingsUpdate {
+  enabled: boolean;
 }
 
 /** Same shape and vocabulary as health finding triage — one triage system. */
@@ -2786,6 +3262,7 @@ export interface RefactoringSummary {
   by_type: RefactoringTypeCount[];
   files_total?: number | null;
   structural_total?: number | null;
+  design_total?: number | null;
   performance_total?: number | null;
   small_effort_total?: number | null;
   health_recovery_total?: number | null;
@@ -2796,6 +3273,7 @@ export interface RefactoringSummary {
 export interface RefactoringTargetsResponse {
   summary: RefactoringSummary;
   plans: RefactoringPlanResponse[];
+  gated?: Record<string, Record<string, unknown>>;
 }
 
 export interface RefactoringTypeCount {
@@ -2826,6 +3304,7 @@ export interface RelatedWorkItem {
 export interface RelatedWorkLens {
   items?: RelatedWorkItem[];
   total?: number;
+  preview?: string | null;
 }
 
 /** The files to look up, repo-relative. Validated by the route. */
@@ -2837,6 +3316,30 @@ export interface RelatedWorkRequest {
 export interface RelatedWorkResponse {
   files?: RelatedWorkFile[];
   per_lens_limit?: number;
+}
+
+/** A release's "By the numbers", from ``scripts/release_stats.py``. */
+export interface ReleaseStatsModel {
+  since: string;
+  days: number;
+  prs: number;
+  contributors: number;
+  first_time_contributors?: number | null;
+  files_changed: number;
+  lines_added: number;
+  lines_removed: number;
+  types: ReleaseTypeCountsModel;
+  test_files_touched: number;
+  test_files_new: number;
+  issues_closed: number;
+}
+
+export interface ReleaseTypeCountsModel {
+  fixes?: number;
+  features?: number;
+  perf?: number;
+  refactors?: number;
+  docs?: number;
 }
 
 export interface RepoCreate {
@@ -3148,15 +3651,64 @@ export interface SecurityFindingResponse {
   found_in_history: boolean;
 }
 
+export interface SecuritySummaryResponse {
+  scanned_at?: string | null;
+}
+
+export interface SelectionProvenance {
+  provider?: string | null;
+  model?: string | null;
+  base_url?: string | null;
+}
+
 export interface SetActiveProviderRequest {
   provider: string;
   model?: string | null;
+  base_url?: string | null;
   repo_id?: string | null;
 }
 
 export interface SetApiKeyRequest {
   api_key: string;
   repo_id?: string | null;
+}
+
+/** One change in reading order; ``signals`` holds each signal that fired. */
+export interface Suspect {
+  id: string;
+  ref?: string | null;
+  title: string;
+  merged_at?: string | null;
+  category: string;
+  head_sha: string;
+  files_changed: number;
+  provenance?: string | null;
+  rank: number;
+  signals: Record<string, SuspectSignal>;
+}
+
+export interface SuspectSignal {
+  rank: number;
+  evidence: string[];
+}
+
+/** A symptom and the window to rank the changes merged in. */
+export interface SuspectsRequest {
+  symptom?: string;
+  files?: string[];
+  trace?: string;
+  since?: string | null;
+  until?: string | null;
+  limit?: number;
+}
+
+export interface SuspectsResponse {
+  window: Record<string, string>;
+  candidates: number;
+  texts_missing?: number;
+  symptom_files?: string[];
+  suspects: Suspect[];
+  note: string;
 }
 
 /**
@@ -3355,6 +3907,8 @@ export interface VersionResponse {
   store_compatible?: boolean | null;
   reindex_recommended?: boolean;
   reindex_command?: string | null;
+  highlights?: ChangelogHighlightModel[];
+  latest_highlights?: string[];
 }
 
 export interface WebhookResponse {

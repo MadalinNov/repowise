@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import shutil
 import subprocess
 import threading
 import time
@@ -11,7 +12,6 @@ from collections import OrderedDict
 from functools import partial
 from typing import Any
 
-import pathspec
 import structlog
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
@@ -21,11 +21,15 @@ from repowise.core.analysis.change_health.service import (
     DeltaRequest,
 )
 from repowise.core.analysis.change_risk import (
+    FixHistoryUnavailableError,
     change_risk_payload,
+    fixes_reachable_from,
     normalize_extensions,
     score_live_change,
 )
-from repowise.core.analysis.pr_blast import rank_tests_by_reach
+from repowise.core.analysis.change_risk.features import revspec_head
+from repowise.core.analysis.change_risk.render import LIMITS, size_text
+from repowise.core.analysis.git_cli import path_filter
 from repowise.core.analysis.prior_fix_impact import (
     FixRecord,
     PriorFixFile,
@@ -65,11 +69,16 @@ from repowise.server.mcp_server._helpers import (
     resolve_enum_argument,
 )
 from repowise.server.mcp_server._meta import build_meta as _build_meta
-from repowise.server.mcp_server._meta import read_live_head
 from repowise.server.mcp_server._test_impact import (
     _norm,
     cross_repo_tests,
     tests_block_for,
+)
+from repowise.server.mcp_server._test_selection import (
+    UNAVAILABLE_REASON,
+    SelectionUnavailableError,
+    select_change_tests,
+    selection_block,
 )
 
 log = structlog.get_logger(__name__)
@@ -110,7 +119,9 @@ _SHED_ORDER = response_budget_shed_order("get_change_risk")
 #: Per-field units and calibration. Identical on every call, so it is opt-in.
 #: ``diagnostics`` carries the raw model mechanics; ``findings`` lifts the
 #: top-findings cap. Both are projections, recoverable by an exact call.
-_INCLUDE_BLOCKS = frozenset({"scales", "diagnostics", "findings"})
+#: ``evidence`` adds the change's evidence checklist, the record ``repowise
+#: changes show`` and the REST change detail serve.
+_INCLUDE_BLOCKS = frozenset({"scales", "diagnostics", "findings", "evidence"})
 
 #: Score mechanics that are identical or near-identical on every call. Moved
 #: behind ``include=["diagnostics"]`` so the action-first blocks lead.
@@ -128,6 +139,175 @@ _DIAGNOSTIC_FIELDS = (
     "score",
     "fallback_band",
 )
+
+#: Comparison mechanics on ``health_delta``: the analyzer fingerprint, the two
+#: resolved revisions and the fixed limits text. Behind ``diagnostics`` too.
+_HEALTH_DIAGNOSTIC_FIELDS = ("analyzer", "base", "head", "limits")
+
+#: ``classification`` labels for the MCP surface. ``review_priority`` is a
+#: tercile of the diff-shape rank, so the label names size, not a verdict.
+#: Both ship only under ``include=["scales"]``: ``risk_percentile`` is the one
+#: rank on the default response.
+_DIFF_SIZE_LABELS = {
+    "low": "Below-typical diff size",
+    "moderate": "Typical diff size",
+    "high": "Above-typical diff size",
+}
+
+
+def _path_patterns(value: list[str] | str | None) -> tuple[str, ...]:
+    """A list of patterns, or one comma-separated string, as a pattern tuple.
+
+    ``tuple("src/")`` would be one pattern per character, which matches nothing.
+    """
+    items = value.split(",") if isinstance(value, str) else value or ()
+    return tuple(item.strip() for item in items if item.strip())
+
+
+async def _score_change(
+    repo_path: Any,
+    revspec: str | None,
+    extensions: list[str] | None,
+    exclude_patterns: list[str] | None,
+    include_paths: tuple[str, ...],
+    baseline: int,
+) -> tuple[Any, dict | None]:
+    """Score the live change: ``(result, None)``, or ``(None, error reply)``."""
+    try:
+        result = await asyncio.to_thread(
+            score_live_change,
+            repo_path,
+            revspec,
+            extensions=tuple(extensions or ()),
+            exclude_patterns=tuple(exclude_patterns or ()),
+            include_paths=include_paths,
+            baseline=baseline,
+        )
+    except ValueError as exc:
+        return None, {"error": str(exc)}
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or "").strip() or str(exc)
+        return None, {"error": f"Could not read change {revspec or 'HEAD'!r}: {detail}"}
+    except subprocess.TimeoutExpired:
+        return None, {"error": f"git timed out reading change {revspec or 'HEAD'!r}."}
+    except FileNotFoundError:
+        # Scoring spawns git from several readers, so the missing binary is
+        # named once here. Any other missing file is a real bug: re-raise.
+        if shutil.which("git") is not None:
+            raise
+        return None, {
+            "error": "git was not found on PATH; change risk reads the repository history."
+        }
+    return result, None
+
+
+async def _attach_change_blocks(
+    ctx: Any,
+    payload: dict,
+    result: Any,
+    revspec: str | None,
+    extensions: list[str] | None,
+    changed_read: tuple[Any, Any],
+    collector: OmissionCollector,
+    include_paths: tuple[str, ...] = (),
+) -> None:
+    """Attach the tests, patch coverage, prior fixes and cross-repo blocks, in that order."""
+    changed, changed_error = changed_read
+    payload["impacted_tests"] = await _impacted_tests_block(
+        ctx,
+        changed,
+        changed_error,
+        collector,
+        revspec=revspec,
+        working_tree=result.working_tree,
+        owned_excludes=result.owned_excludes,
+    )
+    patch_changed, patch_error, patch_label, patch_revspec = await _push_change(
+        str(ctx.path),
+        revspec,
+        result.working_tree,
+        normalize_extensions(tuple(extensions or ())),
+        result.riskignore_excludes + result.request_excludes,
+        (changed, changed_error),
+        include_paths,
+    )
+    patch = await _patch_coverage_block(
+        ctx, patch_changed, patch_error, patch_revspec, result, collector, label=patch_label
+    )
+    if patch is not None:
+        payload["patch_coverage"] = patch
+    prior_fixes = await _prior_fixes_block(ctx, changed, history_ref=result.history_ref)
+    if prior_fixes is not None:
+        # One fix record, not two. The blocks answered the same question
+        # with different arithmetic (decayed pressure vs raw count) and a
+        # reader had to work out which was which.
+        payload.setdefault("fix_history", {})["overlap"] = prior_fixes
+    alias = getattr(ctx, "alias", "")
+    # The join needs an open index per consumer repo, so it runs once for
+    # the whole change and the block distributes its rows.
+    impact = await cross_repo_tests(alias, sorted(changed))
+    cross_repo = _cross_repo_block(alias, sorted(changed), impact, collector)
+    if cross_repo is not None:
+        payload["cross_repo"] = cross_repo
+
+
+def _include_blocks(include: list[str] | None, ignored: list[dict]) -> set[str]:
+    """The valid ``include`` blocks; unknown ones are recorded in ``ignored``."""
+    return {
+        block
+        for block in (include or [])
+        if resolve_enum_argument(block, _INCLUDE_BLOCKS, argument="include", ignored=ignored)
+    }
+
+
+async def _attach_branch_blocks(
+    ctx: Any,
+    payload: dict,
+    changed: Any,
+    collector: OmissionCollector,
+    revspec: str | None,
+    finding_id: str | None,
+) -> Any:
+    """Attach ``branch_overlap`` and return the independent-changes block, or None."""
+    # A drill-down returns one finding and nothing else, so neither block
+    # would reach the caller; both are pure cost on that path.
+    if finding_id is not None:
+        return None
+    overlap = await _branch_overlap_block(ctx, changed, collector, revspec_head(revspec))
+    if overlap is not None:
+        payload["branch_overlap"] = overlap
+    return await _independent_changes_block(ctx, changed, collector, revspec)
+
+
+def _shape_payload(result: Any, include_set: set[str], revspec: str | None) -> tuple[dict, dict]:
+    """The score's payload trimmed to what the request asked for.
+
+    Returns ``(payload, diagnostics)``; ``diagnostics`` holds the fields moved
+    out of the payload when the caller did not ask for them.
+    """
+    payload = change_risk_payload(result, scales="scales" in include_set)
+    if "scales" not in include_set:
+        payload.pop("review_priority")
+        payload.pop("classification")
+    elif payload.get("review_priority") in _DIFF_SIZE_LABELS:
+        payload["classification"] = _DIFF_SIZE_LABELS[payload["review_priority"]]
+    if "diagnostics" not in include_set:
+        diagnostics = {f: payload.pop(f) for f in _DIAGNOSTIC_FIELDS if f in payload}
+        # The fix record reads as files and counts; its rank is a second
+        # percentile beside ``risk_percentile`` and only invited comparing them.
+        payload["fix_history"].pop("percentile", None)
+        payload["fix_history"].pop("density", None)
+    else:
+        diagnostics = {}
+    # Fields that only repeat the request or say nothing: an empty exclude list,
+    # a working-tree flag after an explicit revspec, a false ``is_fix``.
+    if not payload["exclude_patterns"]:
+        del payload["exclude_patterns"]
+    if revspec is not None:
+        del payload["working_tree"]
+    if not payload["is_fix"]:
+        del payload["is_fix"]
+    return payload, diagnostics
 
 
 @mcp.tool(
@@ -153,15 +333,15 @@ async def get_change_risk(
     them, name their ``attribution`` basis, and sort change-written above
     pre-existing.
 
-    Trust ``health_delta.status``: ``partial`` means files were skipped and the
-    change is not cleared.
+    ``directive.status`` is the verdict; ``partial`` health means code files
+    were skipped. ``risk_percentile`` and ``diff_shape`` measure diff size
+    only, not danger.
 
-    ``impacted_tests`` keeps measured coverage and inferred candidates distinct.
+    ``impacted_tests`` is the ``impacted-tests`` selection; read ``run_all``.
     ``patch_coverage`` is the share of changed executable lines stored coverage
     ran; ``hints`` name tests to extend. ``fix_history`` is the changed files'
     bug-fix record, ``overlap`` the past fixes on these exact lines,
-    ``branch_overlap`` other branches editing them. ``diff_shape`` is one line
-    on size, not a danger verdict. An empty diff returns
+    ``branch_overlap`` other branches editing them. An empty diff returns
     ``status: "nothing_to_score"``.
 
     Args:
@@ -173,45 +353,29 @@ async def get_change_risk(
         include_paths: Gitignore-style paths to keep, as a list or one
             comma-separated string, e.g. ``"src/api/,src/db/"``. Omit for all.
         baseline: Recent commits sampled for percentile ranking; 0 disables it.
-        include: ``"findings"``, ``"diagnostics"`` (raw score mechanics) or
-            ``"scales"`` (units).
+        include: ``"findings"``, ``"diagnostics"`` (raw mechanics),
+            ``"scales"`` (units, tercile) or ``"evidence"`` (checklist).
         finding_id: Expand one ``health_delta`` finding by its id.
     """
     if repo == "all":
         return _unsupported_repo_all("get_change_risk")
     ctx = await _resolve_repo_context(repo)
     started = time.perf_counter()
-    try:
-        result = await asyncio.to_thread(
-            score_live_change,
-            ctx.path,
-            revspec,
-            extensions=tuple(extensions or ()),
-            exclude_patterns=tuple(exclude_patterns or ()),
-            baseline=baseline,
-        )
-    except ValueError as exc:
-        return {"error": str(exc)}
-    except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or "").strip() or str(exc)
-        return {"error": f"Could not read change {revspec or 'HEAD'!r}: {detail}"}
-    except subprocess.TimeoutExpired:
-        return {"error": f"git timed out reading change {revspec or 'HEAD'!r}."}
+    includes = _path_patterns(include_paths)
+    result, error = await _score_change(
+        ctx.path, revspec, extensions, exclude_patterns, includes, baseline
+    )
+    if error is not None:
+        return error
     ignored: list[dict] = []
-    include_set = {
-        block
-        for block in (include or [])
-        if resolve_enum_argument(block, _INCLUDE_BLOCKS, argument="include", ignored=ignored)
-    }
-    payload = change_risk_payload(result, scales="scales" in include_set)
-    if "diagnostics" not in include_set:
-        diagnostics = {f: payload.pop(f) for f in _DIAGNOSTIC_FIELDS if f in payload}
-    else:
-        diagnostics = {}
+    include_set = _include_blocks(include, ignored)
+    payload, diagnostics = _shape_payload(result, include_set, revspec)
+    scored = await asyncio.to_thread(_scored_repo, str(ctx.path), revspec, result.working_tree)
     if result.features.nf == 0:
-        return await _nothing_to_score(ctx, payload["ref"], started)
+        return await _nothing_to_score(ctx, payload["ref"], scored, started)
+    payload = {"ref": payload.pop("ref"), "scored_repo": scored, **payload}
     # Changed lines over the SAME file universe the score counted (its
-    # extensions + riskignore + request excludes), so nothing downstream
+    # extensions, includes, riskignore + request excludes), so nothing downstream
     # disagrees with the score about which files the change touches. Read once
     # and shared: both blocks below need it and git is the expensive part.
     # The test and fix blocks need the index and the cross-repo block needs
@@ -222,6 +386,7 @@ async def get_change_risk(
         revspec,
         normalize_extensions(tuple(extensions or ())),
         result.riskignore_excludes + result.request_excludes,
+        includes,
         working_tree=result.working_tree,
     )
     collector = OmissionCollector("get_change_risk", repo_root=ctx.path)
@@ -234,47 +399,16 @@ async def get_change_risk(
             revspec,
             tuple(extensions or ()),
             tuple(result.riskignore_excludes + result.request_excludes),
-            tuple(include_paths or ()),
+            includes,
         )
     )
     try:
-        payload["impacted_tests"] = await _impacted_tests_block(
-            ctx, changed, changed_error, collector
+        await _attach_change_blocks(
+            ctx, payload, result, revspec, extensions, (changed, changed_error), collector, includes
         )
-        patch_changed, patch_error, patch_label, patch_revspec = await _push_change(
-            str(ctx.path),
-            revspec,
-            result.working_tree,
-            normalize_extensions(tuple(extensions or ())),
-            result.riskignore_excludes + result.request_excludes,
-            (changed, changed_error),
+        independent = await _attach_branch_blocks(
+            ctx, payload, changed, collector, revspec, finding_id
         )
-        patch = await _patch_coverage_block(
-            ctx, patch_changed, patch_error, patch_revspec, result, collector, label=patch_label
-        )
-        if patch is not None:
-            payload["patch_coverage"] = patch
-        prior_fixes = await _prior_fixes_block(ctx, changed)
-        if prior_fixes is not None:
-            # One fix record, not two. The blocks answered the same question
-            # with different arithmetic (decayed pressure vs raw count) and a
-            # reader had to work out which was which.
-            payload.setdefault("fix_history", {})["overlap"] = prior_fixes
-        alias = getattr(ctx, "alias", "")
-        # The join needs an open index per consumer repo, so it runs once for
-        # the whole change and the block distributes its rows.
-        impact = await cross_repo_tests(alias, sorted(changed))
-        cross_repo = _cross_repo_block(alias, sorted(changed), impact, collector)
-        if cross_repo is not None:
-            payload["cross_repo"] = cross_repo
-        # A drill-down returns one finding and nothing else, so neither block
-        # would reach the caller; both are pure cost on that path.
-        overlap = independent = None
-        if finding_id is None:
-            overlap = await _branch_overlap_block(ctx, changed, collector)
-            if overlap is not None:
-                payload["branch_overlap"] = overlap
-            independent = await _independent_changes_block(ctx, changed, collector, revspec)
     except BaseException:
         # Never leave the comparison running for a request that is already over.
         delta_task.cancel()
@@ -286,7 +420,23 @@ async def get_change_risk(
     payload["diff_shape"] = _diff_shape_sentence(payload, diagnostics)
     if independent is not None:
         payload["independent_changes"] = independent
-    _attach_health(payload, delta, revspec, expand="findings" in include_set)
+    _attach_health(
+        payload,
+        delta,
+        revspec,
+        expand="findings" in include_set,
+        diagnostics="diagnostics" in include_set,
+    )
+    if "evidence" in include_set:
+        payload["evidence"] = await _evidence_block(
+            ctx,
+            revspec,
+            result,
+            delta,
+            tuple(extensions or ()),
+            tuple(result.riskignore_excludes + result.request_excludes),
+            scoped=bool(extensions or exclude_patterns or includes or baseline != 200),
+        )
     # source: live_git marks that the *score* is computed from the working
     # checkout's git. The two blocks above are index-backed, so the freshness
     # fields do apply to them, scoped to the change's files. None (not []) when
@@ -301,6 +451,58 @@ async def get_change_risk(
     attach_ignored_arguments(payload, ignored)
     collector.attach(payload)
     return payload
+
+
+async def _evidence_block(
+    ctx: Any,
+    revspec: str | None,
+    result: Any,
+    delta: Any,
+    extensions: tuple[str, ...],
+    exclude_patterns: tuple[str, ...],
+    *,
+    scoped: bool,
+) -> dict[str, Any]:
+    """The change's evidence checklist, reusing the score and delta already computed.
+
+    A revspec naming a stored change, asked with no filters of the caller's
+    own, returns that change's kept record (building and keeping it when
+    there is none), so this and ``repowise changes show`` serve the same one.
+    """
+    from repowise.core.changes.collect import (
+        NO_INDEX,
+        change_evidence,
+        evidence_for_revspec,
+        stored_change_at,
+    )
+    from repowise.core.persistence.database import get_session
+
+    kwargs: dict[str, Any] = {
+        "risk": result,
+        "health": delta,
+        "extensions": extensions,
+        "exclude_patterns": exclude_patterns,
+    }
+    no_index = NO_INDEX
+    session_factory = getattr(ctx, "session_factory", None)
+    if session_factory is not None:
+        try:
+            async with get_session(session_factory) as session:
+                repo = await _get_repo(session)
+                row = await stored_change_at(session, repo.id, ctx.path, revspec)
+                if row is not None and not scoped and not result.riskignore_excludes:
+                    evidence = await change_evidence(
+                        session, repo.id, ctx.path, row, risk=result, health=delta
+                    )
+                else:
+                    evidence = await evidence_for_revspec(
+                        session, repo.id, ctx.path, revspec, row=row, **kwargs
+                    )
+                return evidence.to_dict()
+        except (LookupError, SQLAlchemyError) as exc:
+            no_index = f"the index could not be read: {type(exc).__name__}: {exc}"
+    evidence = await evidence_for_revspec(None, "", ctx.path, revspec, no_index=no_index, **kwargs)
+    return evidence.to_dict()
 
 
 #: One service per repository, so its comparison cache and stampede guard
@@ -425,9 +627,14 @@ async def _attach_health_references(ctx: Any, delta: Any) -> None:
         }
 
 
-def _attach_health(payload: dict, delta: Any, revspec: str | None, *, expand: bool) -> None:
+def _attach_health(
+    payload: dict, delta: Any, revspec: str | None, *, expand: bool, diagnostics: bool = False
+) -> None:
     """Put the directive first and the compact delta second."""
     block = _health_delta_block(delta, revspec=revspec)
+    if not diagnostics:
+        for key in _HEALTH_DIAGNOSTIC_FIELDS:
+            block.pop(key, None)
     if expand:
         from repowise.server.mcp_server._change_health import finding_row
 
@@ -448,7 +655,20 @@ def _attach_health(payload: dict, delta: Any, revspec: str | None, *, expand: bo
     payload.update(ordered)
 
 
-async def _nothing_to_score(ctx: Any, ref: str, started: float) -> dict:
+def _scored_repo(path: str, revspec: str | None, working_tree: bool) -> dict[str, Any]:
+    """The checkout the change was read in and the commit its head resolved to.
+
+    ``HEAD`` or a branch name resolves in the served checkout, not in the
+    caller's worktree, so naming both makes a review of the wrong tree visible.
+    Uncommitted work is marked, so its ``head`` does not read as the change.
+    """
+    from repowise.core import git_refs
+
+    head = git_refs.resolve(path, revspec_head(revspec))[:12] or None
+    return {"root": path, "head": head, **({"working_tree": True} if working_tree else {})}
+
+
+async def _nothing_to_score(ctx: Any, ref: str, scored: dict[str, Any], started: float) -> dict:
     """An empty diff, reported as one rather than scored.
 
     Scoring it anyway produced a real-looking "Below typical" verdict, which
@@ -460,9 +680,9 @@ async def _nothing_to_score(ctx: Any, ref: str, started: float) -> dict:
         "status": "nothing_to_score",
         "warning": (
             f"No counted file changes in {ref!r} "
-            "(check the revspec, extensions, or exclusion filters)."
+            "(check the revspec, extensions, or include/exclude filters)."
         ),
-        "scored_repo": {"root": str(ctx.path), "head": read_live_head(str(ctx.path))},
+        "scored_repo": scored,
         "_meta": _build_meta(
             timing_ms=(time.perf_counter() - started) * 1000,
             repository=await _repository(ctx),
@@ -477,14 +697,8 @@ def _diff_shape_sentence(payload: dict, diagnostics: dict) -> str:
     It replaced a block that restated four fields already at the top level and
     was read in 2 of 118 recorded calls.
     """
-    pct = payload.get("risk_percentile")
-    where = (
-        f"bigger than {round(pct)}% of this repo's recent commits"
-        if pct is not None
-        else "unranked (no baseline to compare against)"
-    )
     tail = " Mechanics: get_change_risk(include=['diagnostics'])." if diagnostics else ""
-    return f"Diff shape: {where}. Size and spread, not danger.{tail}"
+    return f"{size_text(payload.get('risk_percentile'))}. {LIMITS}{tail}"
 
 
 def _drill_down(payload: dict, delta: Any, finding_id: str, revspec: str | None) -> dict:
@@ -525,23 +739,16 @@ def _filter_changed(
     changed: dict[str, set[int]],
     extensions: tuple[str, ...],
     exclude_patterns: tuple[str, ...],
+    include_paths: tuple[str, ...] = (),
 ) -> dict[str, set[int]]:
     """Restrict changed-line files to the score's counted universe.
 
-    ``changed_lines`` applies no suffix/exclude filtering, so without this a
-    change scored ``nf == 0`` under an extension filter could still surface
-    impacted tests for the filtered-out files. Uses the same ``endswith`` +
-    gitwildmatch rules as the numstat accumulator.
+    ``changed_lines`` applies no suffix/include/exclude filtering, so without
+    this a change scored ``nf == 0`` under a filter could still surface impacted
+    tests for the filtered-out files. Uses the score's own path rule.
     """
-    spec = pathspec.PathSpec.from_lines("gitwildmatch", exclude_patterns)
-    out: dict[str, set[int]] = {}
-    for path, lines in changed.items():
-        if extensions and not path.endswith(extensions):
-            continue
-        if spec.match_file(path):
-            continue
-        out[path] = lines
-    return out
+    counts = path_filter(extensions, exclude_patterns, include_paths)
+    return {path: lines for path, lines in changed.items() if counts(path)}
 
 
 def _cross_repo_block(
@@ -724,26 +931,21 @@ def _cross_repo_block(
 
 
 def _empty_impacted(status: str, summary: str) -> dict[str, Any]:
-    """Uniform impacted-tests block for the degraded (no tests to name) paths.
+    """Uniform impacted-tests block for the paths where no selection was made.
 
-    ``basis`` says which signal named the tests (``none`` here) and
-    ``tests_to_run_kind`` what each entry is: a coverage-map ``test_id`` on
-    the measured basis, a ``test_file`` on the inferred one.
+    Nothing vouches for a subset there, so the block says ``run_all`` with the
+    reason, like a selection that cannot vouch for one. ``basis`` is ``none``
+    and nothing is named, so there is no ``tests_to_run_kind``, ``map_present``
+    or ``line_coverage``.
     """
     return {
         "status": status,
+        "run_all": True,
+        "reasons": [summary, UNAVAILABLE_REASON],
         "basis": "none",
-        "map_present": False,
         "tests_to_run": [],
-        "tests_to_run_kind": None,
         "total": 0,
         "truncated": False,
-        "line_coverage": {
-            "untested_changes": [],
-            "stale_test_candidates": [],
-            "covered": [],
-            "no_coverage_data": [],
-        },
         "summary": summary,
     }
 
@@ -778,6 +980,7 @@ async def _changed_in_scope(
     revspec: str | None,
     extensions: tuple[str, ...],
     exclude_patterns: tuple[str, ...],
+    include_paths: tuple[str, ...] = (),
     *,
     working_tree: bool = False,
 ) -> tuple[dict[str, set[int]], tuple[str, str] | None]:
@@ -789,7 +992,7 @@ async def _changed_in_scope(
     two blocks want the same answer.
     """
     changed, error, _label = await _changed_with_label(
-        repo_path, revspec, extensions, exclude_patterns, working_tree=working_tree
+        repo_path, revspec, extensions, exclude_patterns, include_paths, working_tree=working_tree
     )
     return changed, error
 
@@ -799,6 +1002,7 @@ async def _changed_with_label(
     revspec: str | None,
     extensions: tuple[str, ...],
     exclude_patterns: tuple[str, ...],
+    include_paths: tuple[str, ...] = (),
     *,
     working_tree: bool = False,
     base: str | None = None,
@@ -820,6 +1024,7 @@ async def _changed_with_label(
                 revspec or "HEAD",
                 working_tree=working_tree,
                 base=base,
+                skip_untracked=exclude_patterns,
             )
         )
     except ValueError as exc:
@@ -827,13 +1032,15 @@ async def _changed_with_label(
     except (subprocess.SubprocessError, OSError):
         return {}, ("unknown", "Could not read changed lines from git."), label
 
-    changed = _filter_changed(changed, extensions, exclude_patterns)
+    changed = _filter_changed(changed, extensions, exclude_patterns, include_paths)
     if not changed:
         return {}, ("no_source_line_changes", "No changed source lines to map to tests."), label
     return changed, None, label
 
 
-async def _prior_fixes_block(ctx: Any, changed: dict[str, set[int]]) -> dict[str, Any] | None:
+async def _prior_fixes_block(
+    ctx: Any, changed: dict[str, set[int]], *, history_ref: str | None = None
+) -> dict[str, Any] | None:
     """Past bug fixes that landed on the lines this change touches, or ``None``.
 
     Aggregate only. No inducing commit is named: file-level SZZ measured 74.5%
@@ -851,7 +1058,7 @@ async def _prior_fixes_block(ctx: Any, changed: dict[str, set[int]]) -> dict[str
     not silent: it renders with ``status: "unavailable"``, because "we could not
     look" and "nothing has broken here" are opposite claims about the change.
     """
-    impact = await _read_prior_fixes(ctx, changed)
+    impact = await _read_prior_fixes(ctx, changed, history_ref=history_ref)
     if impact.status == "unsupported" or (impact.status == "available" and impact.is_empty):
         return None
     if impact.status != "available":
@@ -905,8 +1112,14 @@ def _prior_fix_row(entry: PriorFixFile) -> dict[str, Any]:
     return row
 
 
-async def _read_prior_fixes(ctx: Any, changed: dict[str, set[int]]) -> PriorFixImpact:
+async def _read_prior_fixes(
+    ctx: Any, changed: dict[str, set[int]], *, history_ref: str | None = None
+) -> PriorFixImpact:
     """Collect fix events from the index. Collection only; core summarizes.
+
+    With *history_ref* (the score's own fix-history anchor) only fixes in that
+    ref's history count, so a reviewed commit and its successors in the index
+    are not read back as the ground it stood on.
 
     The four ways this can come back empty are not one state. An index that
     predates fix events has nothing to read (``unsupported``), while a query
@@ -945,6 +1158,12 @@ async def _read_prior_fixes(ctx: Any, changed: dict[str, set[int]]) -> PriorFixI
     except SQLAlchemyError as exc:
         return unavailable_prior_fixes(_read_failure(exc))
 
+    if history_ref is not None:
+        try:
+            events = await _events_before(ctx, events, history_ref)
+        except FixHistoryUnavailableError as exc:
+            return unavailable_prior_fixes(f"could not place fixes in history: {exc}")
+
     return summarize_prior_fixes(
         (
             FixRecord(
@@ -957,6 +1176,14 @@ async def _read_prior_fixes(ctx: Any, changed: dict[str, set[int]]) -> PriorFixI
         ),
         changed,
     )
+
+
+async def _events_before(ctx: Any, events: list[Any], history_ref: str) -> list[Any]:
+    """The fix events in *history_ref*'s history, so a review never counts itself."""
+    kept = await asyncio.to_thread(
+        fixes_reachable_from, str(ctx.path), history_ref, (event.fix_sha for event in events)
+    )
+    return [event for event in events if event.fix_sha in kept]
 
 
 def _read_failure(exc: SQLAlchemyError) -> str:
@@ -1013,21 +1240,25 @@ async def _independent_changes_block(
     return block
 
 
-def _scan_from_trunk(path: str, files: list[str]) -> Any:
-    """The base lookup and the scan, both git, in one hop off the event loop."""
+def _scan_from_trunk(path: str, files: list[str], current: str) -> Any:
+    """The base lookup and the scan, both git, in one hop off the event loop.
+
+    *current* is the reviewed change's head, so a branch reviewed from another
+    worktree is the change itself, not a rival to the served checkout's branch.
+    """
     from repowise.core.analysis.branch_overlap import scan_branches
     from repowise.core.git_refs import default_base
 
-    return scan_branches(path, files, base=default_base(path))
+    return scan_branches(path, files, base=default_base(path), current=current)
 
 
-async def _scan_overlap(ctx: Any, files: list[str]) -> Any:
+async def _scan_overlap(ctx: Any, files: list[str], current: str = "HEAD") -> Any:
     """Run the branch scan, with the index when one opens and without when it does not."""
     from repowise.core.analysis.branch_overlap import rank_with_index
     from repowise.core.persistence.database import get_session
 
     path = str(ctx.path)
-    scan = await asyncio.to_thread(_scan_from_trunk, path, files)
+    scan = await asyncio.to_thread(_scan_from_trunk, path, files, current)
     session_factory = getattr(ctx, "session_factory", None)
     if session_factory is not None:
         try:
@@ -1040,7 +1271,7 @@ async def _scan_overlap(ctx: Any, files: list[str]) -> Any:
 
 
 async def _branch_overlap_block(
-    ctx: Any, changed: dict[str, set[int]], collector: OmissionCollector
+    ctx: Any, changed: dict[str, set[int]], collector: OmissionCollector, current: str = "HEAD"
 ) -> dict[str, Any] | None:
     """Other open branches editing the files this change edits, or ``None``.
 
@@ -1052,7 +1283,7 @@ async def _branch_overlap_block(
         return None
     try:
         overlap = await asyncio.wait_for(
-            _scan_overlap(ctx, sorted(changed)), timeout=_BRANCH_OVERLAP_TIMEOUT_SECONDS
+            _scan_overlap(ctx, sorted(changed), current), timeout=_BRANCH_OVERLAP_TIMEOUT_SECONDS
         )
     except (TimeoutError, subprocess.SubprocessError, OSError):
         return None
@@ -1082,81 +1313,6 @@ async def _branch_overlap_block(
     return block
 
 
-def _cap_tests(tests: list[str], collector: OmissionCollector, label: str) -> list[str]:
-    """First _IMPACTED_TESTS_LIMIT ids; the tail goes to the omission store."""
-    if len(tests) > _IMPACTED_TESTS_LIMIT:
-        collector.add(
-            f"impacted_tests.tests_to_run ({label}) beyond cap={_IMPACTED_TESTS_LIMIT} "
-            f"({len(tests) - _IMPACTED_TESTS_LIMIT} dropped)",
-            tests[_IMPACTED_TESTS_LIMIT:],
-        )
-    return tests[:_IMPACTED_TESTS_LIMIT]
-
-
-async def _inferred_impacted(
-    session: Any, repo_id: str, changed_files: list[str], collector: OmissionCollector
-) -> dict[str, Any]:
-    """Graph-inferred candidates for a repo with no coverage map.
-
-    "Run the full suite" is correct but useless on the repositories that have
-    no coverage report, which is most of them. The dependency graph can narrow
-    it: a test file that reaches a changed file is worth running first. That is
-    a candidate list and is labelled one - ``basis`` is ``"inferred"`` and
-    ``map_present`` stays False, so nothing here can be read as the line-precise
-    measured answer.
-
-    Deliberately file-level and line-blind. Reaching carries no line
-    attribution, so ``line_coverage`` stays empty rather than being filled from
-    a signal that cannot speak to lines - the distinction this whole block
-    exists to keep.
-    """
-    from repowise.core.analysis.test_reachability import load_test_files, tests_reaching
-    from repowise.core.analysis.test_selection import expand_test_scopes
-
-    hint = (
-        "Inferred from the dependency graph, not measured. For the line-precise "
-        "answer build the map with `coverage run --contexts=test` then "
-        "`repowise coverage add`."
-    )
-    try:
-        test_files = await load_test_files(session, repo_id)
-        reaching = await tests_reaching(session, repo_id, changed_files, test_files=test_files)
-    except Exception:
-        test_files, reaching = set(), {}
-    # A conftest the walk stopped at stands for the tests under its directory.
-    tests = rank_tests_by_reach(
-        {path: expand_test_scopes(found, test_files) for path, found in reaching.items()}
-    )
-    if not tests:
-        return _empty_impacted(
-            "no_map",
-            "No per-test coverage map ingested and no test reaches the changed files "
-            "in the graph; run the full suite. " + hint,
-        )
-    total = len(tests)
-    block = _empty_impacted("inferred", "")
-    block.update(
-        {
-            "basis": "inferred",
-            "tests_to_run": _cap_tests(tests, collector, "inferred"),
-            "tests_to_run_kind": "test_file",
-            "total": total,
-            "truncated": total > _IMPACTED_TESTS_LIMIT,
-            "summary": (
-                f"{total} test file(s) reach the changed files in the graph"
-                + (
-                    f"; showing first {_IMPACTED_TESTS_LIMIT}"
-                    if total > _IMPACTED_TESTS_LIMIT
-                    else ""
-                )
-                + ". "
-                + hint
-            ),
-        }
-    )
-    return block
-
-
 async def _push_change(
     repo_path: str,
     revspec: str | None,
@@ -1164,6 +1320,7 @@ async def _push_change(
     extensions: tuple[str, ...],
     exclude_patterns: tuple[str, ...],
     scored: tuple[dict[str, set[int]], tuple[str, str] | None],
+    include_paths: tuple[str, ...] = (),
 ) -> tuple[dict[str, set[int]], tuple[str, str] | None, str | None, str | None]:
     """``(changed, error, label, revspec)`` the patch-coverage block measures.
 
@@ -1182,7 +1339,13 @@ async def _push_change(
         return changed, error, None, revspec
     branch = None if working_tree else f"{base}...HEAD"
     found, found_error, label = await _changed_with_label(
-        repo_path, branch, extensions, exclude_patterns, working_tree=working_tree, base=base
+        repo_path,
+        branch,
+        extensions,
+        exclude_patterns,
+        include_paths,
+        working_tree=working_tree,
+        base=base,
     )
     if found_error is not None and branch is not None:
         # No merge-base with the base (a shallow clone): measure the commit as scored.
@@ -1237,7 +1400,6 @@ async def _patch_coverage_block(
     the last coverage ingest came after the newest edit to the changed files.
     """
     from repowise.core import git_refs
-    from repowise.core.analysis.change_risk.features import revspec_head
     from repowise.core.analysis.health.coverage import configured_coverage
     from repowise.core.analysis.health.coverage.freshness import newest_mtime
     from repowise.core.analysis.patch_coverage import (
@@ -1276,6 +1438,7 @@ async def _patch_coverage_block(
                 head_commit=head_commit,
                 config=configured_coverage(ctx.path),
                 working_tree_mtime=mtime,
+                repo_path=str(ctx.path),
             )
             # An unreadable index row leaves risk to git alone and hints null.
             if patch is not None:
@@ -1340,19 +1503,26 @@ async def _impacted_tests_block(
     changed: dict[str, set[int]],
     changed_error: tuple[str, str] | None,
     collector: OmissionCollector,
+    *,
+    revspec: str | None = None,
+    working_tree: bool = False,
+    owned_excludes: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    """Line-precise impacted tests + honest missing-test buckets for the change.
+    """The tests the change needs, decided as ``repowise impacted-tests`` decides them.
 
-    Built on the same core functions the CLI (``repowise impacted-tests``) and
-    get_risk's guarding-tests path use - ``changed_lines`` -> ``tests_covering``
-    / ``detect_missing_tests`` - so the answer is coverage-grounded. The CLI's
-    filename-pattern guess is deliberately omitted: an agent cannot tell a guess
-    from real coverage, and ``no_coverage_data`` already reports those files
-    honestly as "unknown, run the suite". Degrades to a ``status`` string rather
-    than raising, so it never fails the surrounding score.
+    The same collection and fail-closed selection (``test_collection`` then
+    ``select_tests``) over the whole change, every touched path included, so a
+    manifest, a conftest or a test that walks the source tree weighs here as it
+    does in CI. The caller's suffix, include and exclude filters do not narrow
+    it; only *owned_excludes*, repowise's own output, leaves it, as it leaves
+    every other block. ``line_coverage`` classifies the scored files' lines against
+    the per-test map, on the side of the diff the map was measured at.
+    Any failure degrades to a ``status`` string with ``run_all`` true and never
+    raises, so it cannot fail the surrounding score.
     """
+    from repowise.core.analysis.changed_lines import change_set
     from repowise.core.analysis.missing_test_signal import detect_missing_tests
-    from repowise.core.persistence.crud import tests_covering
+    from repowise.core.analysis.test_collection import query_lines
     from repowise.core.persistence.database import get_session
 
     session_factory = getattr(ctx, "session_factory", None)
@@ -1362,38 +1532,38 @@ async def _impacted_tests_block(
         )
     if changed_error is not None:
         return _empty_impacted(*changed_error)
-
     try:
-        async with get_session(session_factory) as session:
-            repo_id = (await _get_repo(session)).id
-            report = await detect_missing_tests(session, repo_id, changed)
-            if report.map_empty:
-                return await _inferred_impacted(session, repo_id, sorted(changed), collector)
-            by_file: dict[str, list[str]] = {}
-            for source_file, lines in changed.items():
-                rows = await tests_covering(session, repo_id, source_file, lines=lines)
-                ids = sorted({row["test_id"] for row in rows})
-                if ids:
-                    by_file[source_file] = ids
+        change = await asyncio.to_thread(
+            partial(
+                change_set,
+                str(ctx.path),
+                None if working_tree else revspec or "HEAD",
+                working_tree=working_tree,
+                exclude_patterns=owned_excludes,
+            )
+        )
+    except Exception:  # git refused the change, or could not run
+        return _empty_impacted("unknown", "Could not read the change from git.")
+    try:
+        result, selection, _ = await select_change_tests(ctx.path, session_factory, change)
+        block = selection_block(
+            result, selection, collector, limit=_IMPACTED_TESTS_LIMIT, label="impacted_tests"
+        )
+        if not result["map_empty"]:
+            lines = query_lines(change, result["measured_commit"])
+            async with get_session(session_factory) as session:
+                repo_id = (await _get_repo(session)).id
+                report = await detect_missing_tests(
+                    session, repo_id, {p: lines[p] for p in changed if p in lines}
+                )
+            block["line_coverage"] = _serialize_missing(report)
+    except SelectionUnavailableError as exc:
+        return _empty_impacted(exc.status, str(exc))
     except LookupError:
         return _empty_impacted("no_index", "No indexed repository; run `repowise init`.")
     except SQLAlchemyError:
-        return _empty_impacted("unknown", "Could not read the coverage map.")
-
-    tests = rank_tests_by_reach(by_file)
-    total = len(tests)
-    return {
-        "status": "map_present",
-        "basis": "measured",
-        "map_present": True,
-        "tests_to_run": _cap_tests(tests, collector, "measured"),
-        "tests_to_run_kind": "test_id",
-        "total": total,
-        "truncated": total > _IMPACTED_TESTS_LIMIT,
-        "line_coverage": _serialize_missing(report),
-        "summary": (
-            f"{total} test(s) cover the changed lines"
-            + (f"; showing first {_IMPACTED_TESTS_LIMIT}" if total > _IMPACTED_TESTS_LIMIT else "")
-            + "."
-        ),
-    }
+        return _empty_impacted("unknown", "Could not read the index.")
+    except Exception as exc:  # a selection bug must not take the score with it
+        log.warning("impacted_tests_failed", error=f"{type(exc).__name__}: {exc}")
+        return _empty_impacted("unknown", f"Selecting tests failed ({type(exc).__name__}).")
+    return block

@@ -47,6 +47,8 @@ from repowise.cli.helpers import (
 from repowise.core.analysis.health import HEALTH_ANALYZER_VERSION
 from repowise.core.docs_mode import docs_mode_state_fields
 from repowise.core.index_scope import file_page_scope, stamp_index_scope
+from repowise.core.ingestion.git_indexer import GIT_HISTORY_VERSION, GIT_HISTORY_VERSION_KEY
+from repowise.core.ingestion.git_indexer._constants import _DEFAULT_COMMIT_LIMIT
 from repowise.core.update_lock import release_update_lock, try_acquire_update_lock
 
 
@@ -142,6 +144,7 @@ async def _backfill_git(
     )
     from repowise.core.persistence import get_session
     from repowise.core.persistence.crud import (
+        clear_attribution_if_disabled,
         recompute_git_percentiles,
         upsert_git_commits_bulk,
         upsert_git_metadata_bulk,
@@ -171,6 +174,7 @@ async def _backfill_git(
         # (Foundation 1 only wrote them on the full orchestrator index).
         if summary.commit_rows:
             await upsert_git_commits_bulk(session, repo_id, summary.commit_rows)
+        await clear_attribution_if_disabled(session, repo_id)
 
     console.print(
         f"Git tier upgraded to FULL: [cyan]{summary.files_indexed}[/cyan] files "
@@ -267,7 +271,9 @@ async def _run_upgrade(
     # wiring: pipeline_jobs.repository_id is an FK to repositories.id, so the
     # row must exist before the backfill creates its checkpoint job.
     async with get_session(sf) as session:
-        repo = await upsert_repository(session, name=repo_path.name, local_path=str(repo_path))
+        repo = await upsert_repository(
+            session, name=repo_path.name, local_path=str(repo_path), stamp_head=True
+        )
         repo_id = repo.id
 
     # 2. Backfill the git tier ESSENTIAL -> FULL (resumable via JobStore).
@@ -824,6 +830,8 @@ def upgrade_to_full(
         # from the current analyzer. Without the stamp the next plain `update`
         # would read a stale version and pay a redundant full re-score.
         state["health_analyzer_version"] = HEALTH_ANALYZER_VERSION
+        # The git backfill walked every file under the current history rules.
+        state[GIT_HISTORY_VERSION_KEY] = GIT_HISTORY_VERSION
         state["full_upgrade"] = {
             "status": "complete",
             "retryable": False,
@@ -836,7 +844,9 @@ def upgrade_to_full(
             run_mode="standard",
             content_provenance="model",
             git_tier="full",
-            git_commit_cap=commit_limit if isinstance(commit_limit, int) else 500,
+            git_commit_cap=(
+                commit_limit if isinstance(commit_limit, int) else _DEFAULT_COMMIT_LIMIT
+            ),
             git_history_coverage=outcome["git_history_coverage"],
             file_pages=outcome["file_pages"],
             analysis={"unavailable": [], "skipped": []},
@@ -854,7 +864,12 @@ def upgrade_to_full(
         if embedder_name and embedder_name != cfg.get("embedder"):
             from repowise.cli.helpers import save_config_partial
 
-            save_config_partial(repo_path, embedder=embedder_name)
+            # Explicit `embedding_model=None`, not a bare `embedder=`: the
+            # embedder just changed, so any model pinned for the old one no
+            # longer describes what this table was built with, and
+            # `save_config_partial` only clears the pin when told the model
+            # changed, not merely because `embedder` was passed (#2627).
+            save_config_partial(repo_path, embedder=embedder_name, embedding_model=None)
 
         elapsed = time.monotonic() - start
         console.print(

@@ -10,7 +10,6 @@ decisions slice, savings headline, and health KPIs.
 from __future__ import annotations
 
 import asyncio
-import configparser
 import contextlib
 import json
 from pathlib import Path
@@ -23,8 +22,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from repowise.core.analysis.health.aggregation import (
     severity_breakdown as health_severity_breakdown,
 )
+from repowise.core.analysis.health.grading import headline_band
 from repowise.core.analysis.health.scoring import hotspot_health
+from repowise.core.forges import read_remote_url, strip_credentials
 from repowise.core.persistence import crud
+from repowise.core.persistence.crud.analysis.queue_counts import unit_counts
+from repowise.core.persistence.crud.analysis.shown import ungated
 from repowise.core.persistence.models import (
     DeadCodeFinding,
     GenerationJob,
@@ -82,7 +85,7 @@ async def _index_storage_bytes(repowise_dir: Path) -> int:
 
 
 def _remote_url(stored_url: str | None, local_path: str | None) -> str | None:
-    """Best-effort git remote for a repo.
+    """Best-effort git remote for a repo, with any credentials removed.
 
     ``repositories.url`` is client-supplied and empty for most CLI-registered
     repos, so fall back to reading ``origin`` out of ``.git/config``. Parsed
@@ -91,56 +94,11 @@ def _remote_url(stored_url: str | None, local_path: str | None) -> str | None:
     file we can read.
 
     Used only to resolve a repo avatar, so every failure path returns ``None``
-    and the UI falls back to initials.
+    and the UI falls back to initials. The value is sent to the browser, so it
+    passes through ``strip_credentials`` first.
     """
-    if stored_url:
-        return stored_url
-    if not local_path:
-        return None
-
-    git_path = Path(local_path) / ".git"
-    # Worktrees and submodules use a `.git` FILE holding `gitdir: <path>`; the
-    # config lives in the main checkout, so follow the pointer before reading.
-    if git_path.is_file():
-        try:
-            pointer = git_path.read_text(encoding="utf-8").strip()
-        except OSError:
-            return None
-        if not pointer.startswith("gitdir:"):
-            return None
-        resolved = Path(pointer.split(":", 1)[1].strip())
-        if not resolved.is_absolute():
-            resolved = (Path(local_path) / resolved).resolve()
-        # A worktree's gitdir is `<main>/.git/worktrees/<name>`; config is two
-        # levels up. Fall back to the pointed-at dir for the submodule case.
-        git_path = resolved.parent.parent if resolved.parent.name == "worktrees" else resolved
-
-    config_path = git_path / "config"
-    if not config_path.is_file():
-        return None
-
-    # Both flags are load-bearing, not defensive boilerplate:
-    #
-    # strict=False — git tolerates duplicate keys and writes them routinely. A
-    # remote with two `fetch` refspecs is normal, and VS Code writes
-    # `vscode-merge-base` twice under a branch section. Strict parsing raises
-    # DuplicateOptionError on both, which would mean this project's own
-    # checkout never resolves a remote.
-    #
-    # interpolation=None — ConfigParser expands `%` at get() time, so a
-    # perfectly valid remote like `https://user%40company.com@dev.azure.com/...`
-    # raises InterpolationSyntaxError. Left on, that exception escapes the
-    # endpoint and turns the whole Overview into a 404 in order to render an
-    # avatar.
-    parser = configparser.ConfigParser(strict=False, interpolation=None)
-    try:
-        parser.read(config_path, encoding="utf-8")
-        for section in ('remote "origin"', 'remote "upstream"'):
-            if parser.has_option(section, "url"):
-                return parser.get(section, "url").strip() or None
-    except (OSError, configparser.Error):
-        return None
-    return None
+    url = stored_url or (read_remote_url(local_path) if local_path else None)
+    return strip_credentials(url) if url else None
 
 
 def _decision_slim(d: Any) -> dict:
@@ -269,6 +227,7 @@ async def overview_summary(
                 DeadCodeFinding.repository_id == repo_id,
                 DeadCodeFinding.kind == "unused_export",
                 DeadCodeFinding.status == "open",
+                ungated("dead_code", DeadCodeFinding.file_path, DeadCodeFinding.kind),
             )
         )
         or 0
@@ -322,7 +281,9 @@ async def overview_summary(
     # defect-accuracy stat both want every per-file row, and letting each fetch
     # its own pulled the whole table twice per page load.
     health_metrics = await crud.get_health_metrics(session, repo_id)
-    findings = await crud.get_health_findings(session, repo_id)
+    # Every figure here is a KPI the scores counted, so the file-held rows stay
+    # in; ``health.gated`` says what the finding lists leave out.
+    findings = await crud.get_health_findings(session, repo_id, file_holds=False)
     health_summary = await crud.get_health_summary(
         session, repo_id, metrics=health_metrics, findings=findings
     )
@@ -358,7 +319,8 @@ async def overview_summary(
     if len(snapshot.recent) >= 2:
         prev, cur = snapshot.recent[-2], snapshot.recent[-1]
         deltas["average_health"] = round(cur.average_health - prev.average_health, 2)
-        deltas["hotspot_health"] = round(cur.hotspot_health - prev.hotspot_health, 2)
+        if cur.hotspot_health is not None and prev.hotspot_health is not None:
+            deltas["hotspot_health"] = round(cur.hotspot_health - prev.hotspot_health, 2)
         file_counts = await crud.get_health_snapshot_file_counts(session, repo_id, limit=2)
         if len(file_counts) == 2 and all(file_counts):
             deltas["file_count"] = file_counts[1] - file_counts[0]
@@ -509,14 +471,11 @@ async def overview_summary(
     savings = await _savings_headline(repo.local_path)
     repowise_dir = Path(repo.local_path) / ".repowise" if repo.local_path else Path(".repowise")
 
-    # Serve the same read-time self-healed "indexed commit" as /api/repos and
-    # /health/overview: prefer state.json's last_sync_commit over a possibly
-    # stale DB row so the dashboard's indexed-commit display (and any freshness
-    # signal derived from it) doesn't read "behind" after a no-op update left
-    # the repositories row un-restamped.
+    # The same indexed commit as /api/repos and /health/overview: state.json
+    # and the row reconciled, the row's own value when the two diverge.
     from repowise.server.mcp_server._meta import resolve_indexed_commit
 
-    indexed_commit = resolve_indexed_commit(repo.head_commit, repo.local_path)
+    indexed_commit = resolve_indexed_commit(repo.head_commit, repo.local_path) or repo.head_commit
 
     return {
         "repo": {
@@ -553,10 +512,20 @@ async def overview_summary(
             "average_health": health_summary.get("average_health"),
             # Files in a language health has no dialect for: in no figure here.
             "unanalysed_file_count": health_summary.get("unanalysed_file_count", 0),
+            "analysed_share": health_summary.get("analysed_share"),
+            # ``None`` when too few code files were analysed to grade the repo.
+            "band": headline_band(
+                health_summary.get("average_health"), health_summary.get("analysed_share")
+            ),
             "hotspot_health": hotspot_health_value,
             "worst_performer_path": health_summary.get("worst_performer_path"),
             "worst_performer_score": health_summary.get("worst_performer_score"),
             "open_findings": health_summary.get("open_findings", 0),
+            # The findings' count vocabulary, which the Code Health page and the
+            # agent surfaces report too; ``open_findings`` stays for older readers.
+            "finding_counts": (await unit_counts(session, repo_id, "findings")).as_dict(),
+            # Why the finding lists hold some of those back, by language or file hold.
+            "gated": await crud.gated_health_counts(session, repo_id),
             # The two co-equal pillars surfaced alongside the defect headline.
             "maintainability_average": health_summary.get("maintainability_average"),
             "performance_average": health_summary.get("performance_average"),
@@ -572,7 +541,9 @@ async def overview_summary(
                 {
                     "taken_at": s.taken_at.isoformat() if s.taken_at else None,
                     "average_health": round(s.average_health, 2),
-                    "hotspot_health": round(s.hotspot_health, 2),
+                    "hotspot_health": (
+                        round(s.hotspot_health, 2) if s.hotspot_health is not None else None
+                    ),
                 }
                 for s in snapshot.recent
             ],

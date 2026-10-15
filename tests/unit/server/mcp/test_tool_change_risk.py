@@ -54,6 +54,21 @@ async def test_git_timeout_is_an_error_naming_the_change(monkeypatch):
     assert result == {"error": "git timed out reading change 'a..b'."}
 
 
+@pytest.mark.asyncio
+async def test_git_missing_from_path_is_an_error_naming_git(monkeypatch, tmp_path):
+    """The real scorer with no git on PATH: a named error, not a raw FileNotFoundError."""
+
+    async def _context(_repo):
+        return SimpleNamespace(path=str(tmp_path))
+
+    monkeypatch.setattr(tool, "_resolve_repo_context", _context)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    result = await tool.get_change_risk("HEAD")
+    assert result == {
+        "error": "git was not found on PATH; change risk reads the repository history."
+    }
+
+
 # ---------------------------------------------------------------------------
 # Health comparison and its stored-finding references
 # ---------------------------------------------------------------------------
@@ -154,10 +169,11 @@ async def test_repository_is_none_without_a_factory_or_a_repository_row(factory)
 # ---------------------------------------------------------------------------
 
 
-def test_filter_changed_applies_the_scores_suffixes_and_excludes():
+def test_filter_changed_applies_the_scores_suffixes_includes_and_excludes():
     changed = {"src/a.py": {1}, "src/b.ts": {2}, "docs/c.py": {3}}
     assert tool._filter_changed(changed, (".py",), ("docs/",)) == {"src/a.py": {1}}
     assert tool._filter_changed(changed, (), ()) == changed
+    assert tool._filter_changed(changed, (), ("src/b.ts",), ("src/",)) == {"src/a.py": {1}}
 
 
 @pytest.mark.asyncio
@@ -251,7 +267,7 @@ async def test_impacted_tests_pass_a_changed_lines_error_through(factory, tmp_pa
     assert block["status"] == "unknown"
     assert block["summary"] == "Could not read changed lines from git."
     assert block["tests_to_run"] == []
-    assert block["map_present"] is False
+    assert "map_present" not in block
 
 
 @pytest.mark.asyncio
@@ -262,9 +278,16 @@ async def test_impacted_tests_pass_a_changed_lines_error_through(factory, tmp_pa
 async def test_impacted_tests_degrade_on_an_unreadable_index(
     monkeypatch, factory, tmp_path, exc, status
 ):
-    _get_repo_raising(monkeypatch, exc)
+    from repowise.core.analysis import changed_lines
+
+    async def _raise(*_a, **_k):
+        raise exc
+
+    change = changed_lines.ChangeSet({}, set(), "HEAD", None, None)
+    monkeypatch.setattr(changed_lines, "change_set", lambda *_a, **_k: change)
+    monkeypatch.setattr(tool, "select_change_tests", _raise)
     block = await tool._impacted_tests_block(
-        SimpleNamespace(session_factory=factory),
+        SimpleNamespace(session_factory=factory, path=str(tmp_path)),
         {"a.py": {1}},
         None,
         OmissionCollector("get_change_risk", repo_root=tmp_path),
@@ -274,54 +297,26 @@ async def test_impacted_tests_degrade_on_an_unreadable_index(
 
 
 @pytest.mark.asyncio
-async def test_inferred_tests_treat_a_failed_graph_walk_as_no_reach(
-    monkeypatch, session, repo_id, tmp_path
-):
-    """A graph walk that throws falls back to "run the full suite", never an error."""
-    import repowise.core.analysis.test_reachability as reach
+async def test_impacted_tests_read_the_change_less_repowise_output(monkeypatch, factory, tmp_path):
+    """Selection drops repowise's own output, the one exclusion every block shares."""
+    from repowise.core.analysis import changed_lines
 
-    async def _raise(*_a, **_k):
-        raise RuntimeError("graph unreadable")
+    seen: dict = {}
 
-    monkeypatch.setattr(reach, "tests_reaching", _raise)
-    block = await tool._inferred_impacted(
-        session, repo_id, ["a.py"], OmissionCollector("get_change_risk", repo_root=tmp_path)
+    def _change_set(*_a, **kwargs):
+        seen.update(kwargs)
+        raise ValueError("stop here")
+
+    monkeypatch.setattr(changed_lines, "change_set", _change_set)
+    await tool._impacted_tests_block(
+        SimpleNamespace(session_factory=factory, path=str(tmp_path)),
+        {"a.py": {1}},
+        None,
+        OmissionCollector("get_change_risk", repo_root=tmp_path),
+        working_tree=True,
+        owned_excludes=("/AGENTS.md",),
     )
-    assert block["status"] == "no_map"
-    assert "run the full suite" in block["summary"]
-
-
-@pytest.mark.asyncio
-async def test_inferred_tests_run_the_tests_under_a_conftest_not_the_conftest(
-    monkeypatch, session, repo_id, tmp_path
-):
-    """The walk reports a conftest it stopped at; pytest collects nothing from one.
-
-    It stands for the tests under its directory, so ``b.py``, reached only
-    through it, still gets tests rather than "run the full suite".
-    """
-    import repowise.core.analysis.test_reachability as reach
-
-    async def _test_files(*_a, **_k):
-        return {
-            "tests/unit/conftest.py",
-            "tests/unit/test_a.py",
-            "tests/unit/sub/test_b.py",
-            "tests/unit/helpers.py",
-            "tests/other/test_c.py",
-        }
-
-    async def _reaching(*_a, **_k):
-        return {"a.py": ["tests/unit/test_a.py"], "b.py": ["tests/unit/conftest.py"]}
-
-    monkeypatch.setattr(reach, "load_test_files", _test_files)
-    monkeypatch.setattr(reach, "tests_reaching", _reaching)
-    block = await tool._inferred_impacted(
-        session, repo_id, ["a.py", "b.py"], OmissionCollector("get_change_risk", repo_root=tmp_path)
-    )
-    # test_a reaches both files, so it leads.
-    assert block["tests_to_run"] == ["tests/unit/test_a.py", "tests/unit/sub/test_b.py"]
-    assert block["total"] == 2
+    assert seen["exclude_patterns"] == ("/AGENTS.md",)
 
 
 @pytest.mark.asyncio
@@ -346,7 +341,7 @@ async def test_branch_scan_falls_back_to_git_only_when_the_index_will_not_open(
 ):
     """Branch overlap needs only git, so an index failure costs the ranking, not the block."""
     scan = SimpleNamespace(overlap="git-only overlap")
-    monkeypatch.setattr(tool, "_scan_from_trunk", lambda _path, _files: scan)
+    monkeypatch.setattr(tool, "_scan_from_trunk", lambda _path, _files, _current: scan)
     _get_repo_raising(monkeypatch, LookupError("no repo"))
     ctx = SimpleNamespace(path="/repo", session_factory=factory)
     assert await tool._scan_overlap(ctx, ["a.py"]) == "git-only overlap"
@@ -788,10 +783,16 @@ def test_the_directive_names_the_scope_and_the_tests_to_extend():
         "1 changed executable line in the working tree is uncovered; "
         "add tests for them (patch_coverage.files)"
     )
-    # Stale coverage leads: its gaps are not real until the tests run again.
-    assert patch_coverage_action(_patch_block(0, 1, hints, freshness="stale")).startswith(
+    # Files changed since the coverage was measured lead: they have no figure yet.
+    stale = {**_patch_block(0, 1, hints, freshness="stale"), "file_counts": {"stale_file": 2}}
+    assert patch_coverage_action(stale) == (
         "Stored coverage predates this change: re-run the tests with coverage, then "
-        "`repowise coverage add`"
+        "`repowise coverage add` (the hook does it automatically) and call again "
+        "(2 changed files not measured until then)"
+    )
+    # A file untouched since the measurement keeps real figures, stale or not.
+    assert patch_coverage_action(_patch_block(0, 1, freshness="stale")).endswith(
+        "is uncovered; add tests for them (patch_coverage.files)"
     )
 
 

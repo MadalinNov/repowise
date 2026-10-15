@@ -17,7 +17,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     from repowise.core.workspace.extractors.service_boundary import ServiceBoundary
@@ -46,6 +46,12 @@ from repowise.core.update_lock import (
 
 from ..docs_mode import docs_mode_state_fields
 from ..ingestion.change_detector import has_working_tree_changes
+from ..ingestion.git_indexer import (
+    GIT_HISTORY_VERSION,
+    GIT_HISTORY_VERSION_KEY,
+    git_history_stale,
+)
+from ..ingestion.git_indexer._constants import _DEFAULT_COMMIT_LIMIT
 from ..pipeline.phase_timing import PhaseTimingRecorder
 from .config import WorkspaceConfig
 
@@ -156,6 +162,9 @@ class RepoUpdateResult:
     # commit-anchored path, which leaves the stored list alone.
     working_tree_paths: list[str] | None = None
     phase_timings: dict[str, float] | None = None
+    # True when this run walked the whole git history and persisted every row,
+    # so the caller stamps ``git_history_version``.
+    git_history_refreshed: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +279,66 @@ def read_state_commit(repo_path: Path) -> str | None:
     return str(sha) if sha else None
 
 
+class IndexedCommit(NamedTuple):
+    """The commit an index describes, or why it cannot be named."""
+
+    sha: str | None
+    problem: str | None = None
+
+
+def resolve_indexed_commit(repo_path: Path | None, row_commit: str | None) -> IndexedCommit:
+    """The commit the index describes, from ``state.json`` and the repository row.
+
+    Every update writes both from one captured head, so they normally agree.
+    When one is an ancestor of the other (an update interrupted between the
+    two writes, or a row an older build left behind), the index describes the
+    older: the files between them then count as changed since the index was
+    built, which over-selects rather than misses. Two commits neither of which
+    contains the other (a rebase, a restored backup), or a sha git cannot
+    read, leave the commit unknown.
+    """
+    state = read_state_commit(repo_path) if repo_path is not None else None
+    if not state or not row_commit or state == row_commit:
+        return IndexedCommit(state or row_commit)
+    older = _older_commit(str(repo_path), state, row_commit)
+    if older is not None:
+        return IndexedCommit(older)
+    return IndexedCommit(
+        None,
+        f"The index records two commits ({state[:7]} in state.json, {row_commit[:7]} "
+        "in its database) and neither contains the other, so what it describes is "
+        "unknown; run `repowise update`.",
+    )
+
+
+# (repo_path, a, b) -> the older commit, or None when neither contains the
+# other. Only definite answers: a timeout or an unknown sha is asked again.
+_ancestry_cache: dict[tuple[str, str, str], str | None] = {}
+_ANCESTRY_CACHE_MAX = 32
+
+
+def _older_commit(repo_path: str, a: str, b: str) -> str | None:
+    """The one of *a*, *b* that is an ancestor of the other, else ``None``.
+
+    Cached because the freshness envelope asks on every response while the two
+    stamps disagree. Ancestry between two known shas never changes, and the
+    next update makes the stamps equal, which ends the asking.
+    """
+    from ..git_refs import is_ancestor
+
+    key = (repo_path, a, b)
+    if key in _ancestry_cache:
+        return _ancestry_cache[key]
+    a_first = is_ancestor(repo_path, a, b)
+    b_first = None if a_first else is_ancestor(repo_path, b, a)
+    older = a if a_first else b if b_first else None
+    if older is not None or (a_first is False and b_first is False):
+        if len(_ancestry_cache) >= _ANCESTRY_CACHE_MAX:
+            _ancestry_cache.clear()
+        _ancestry_cache[key] = older
+    return older
+
+
 def sync_workspace_state_from_disk(
     workspace_root: Path,
     ws_config: WorkspaceConfig,
@@ -335,6 +404,34 @@ def check_repo_staleness(
 
     behind = count_commits_between(repo_path, last_commit, current_head)
     return True, current_head, behind
+
+
+def restamp_changed_sync_commit(repo_path: Path, previous: str | None, current: str | None) -> None:
+    """Move the repository row to a ``last_sync_commit`` a state write just changed.
+
+    The CLI and server state writers call this (the workspace updater awaits
+    :func:`reconcile_repo_head_commit` itself), so a path that advances the
+    sync commit leaves the row on the same commit, whatever HEAD its persist
+    step read (a pull during a long run moves it). An unchanged commit is left
+    alone: the "up to date" paths stamp it themselves. The state file is
+    already written, so a failure here is logged, not raised.
+    """
+    if not current or current == previous:
+        return
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        # Ceiling: callers must be off-loop; skipped here, the resolver still
+        # reads the ancestor pair this leaves correctly.
+        _log.warning("Skipped the repository row restamp for %s: called on an event loop", repo_path)
+        return
+    try:
+        asyncio.run(reconcile_repo_head_commit(repo_path, current))
+    except Exception:
+        _log.warning("Could not restamp the repository row for %s", repo_path, exc_info=True)
 
 
 async def reconcile_repo_head_commit(repo_path: Path, head: str | None) -> None:
@@ -413,6 +510,7 @@ async def _incremental_repo_update(
     base_ref: str,
     exclude_patterns: list[str] | None = None,
     include_working_tree: bool = False,
+    force_full_git: bool = False,
 ) -> RepoUpdateResult | None:
     """Refresh an already-indexed repo through the incremental update path.
 
@@ -458,7 +556,7 @@ async def _incremental_repo_update(
         detector.get_changed_files(base_ref, head),
         working_tree_diffs,
     )
-    if not file_diffs:
+    if not file_diffs and not force_full_git:
         # New commits but nothing the index cares about changed (merge/empty
         # commits, or every change excluded). Report success so the caller
         # bumps ``last_sync_commit`` instead of re-diffing forever.
@@ -475,6 +573,7 @@ async def _incremental_repo_update(
     # persisted alongside the changed rows, kept out of git_meta_map so partial
     # health's repo-wide aggregates are unaffected (mirrors the CLI path).
     git_decay_map: dict[str, dict] = {}
+    full_git_summaries: list[Any] = []
     (
         parsed_files,
         source_map,
@@ -491,6 +590,8 @@ async def _incremental_repo_update(
         include_submodules=bool(state.get("include_submodules", False)),
         include_nested_repos=bool(state.get("include_nested_repos", False)),
         idle_decay_sink=git_decay_map,
+        force_full_git=force_full_git,
+        git_summary_sink=full_git_summaries,
         log=_log.info,
     )
 
@@ -564,6 +665,8 @@ async def _incremental_repo_update(
         log=_log.info,
     )
 
+    # A full walk is stamped only when its rows reached the store.
+    failed_steps: list[str] = []
     await persist_incremental_index(
         repo_path,
         graph_builder,
@@ -579,7 +682,10 @@ async def _incremental_repo_update(
         file_diffs=file_diffs,
         knowledge_graph_result=kg,
         parsed_files=parsed_files,
+        source_map=source_map,
         git_decay_map=git_decay_map,
+        full_git_summary=full_git_summaries[0] if full_git_summaries else None,
+        failed_steps=failed_steps,
         log=_log.info,
     )
 
@@ -600,6 +706,7 @@ async def _incremental_repo_update(
         symbol_count=sum(len(pf.symbols) for pf in parsed_files),
         kg_state=kg_state,
         working_tree_paths=working_tree_paths,
+        git_history_refreshed=bool(full_git_summaries) and "Git persist" not in failed_steps,
     )
 
 
@@ -636,7 +743,7 @@ async def _has_persisted_repo_index(repo_path: Path) -> bool:
 async def update_single_repo_index(
     repo_path: Path,
     *,
-    commit_depth: int = 500,
+    commit_depth: int = _DEFAULT_COMMIT_LIMIT,
     exclude_patterns: list[str] | None = None,
     include_working_tree: bool = False,
     progress: Any | None = None,
@@ -723,6 +830,7 @@ async def update_single_repo_index(
                 base_ref=str(base_ref),
                 exclude_patterns=exclude_patterns,
                 include_working_tree=include_working_tree,
+                force_full_git=git_history_stale(state),
             )
             if incremental_result is not None:
                 return incremental_result
@@ -763,6 +871,7 @@ async def update_single_repo_index(
             file_count=result.file_count,
             symbol_count=result.symbol_count,
             kg_state=kg_state,
+            git_history_refreshed=getattr(result, "git_summary", None) is not None,
         )
     except Exception as exc:
         return RepoUpdateResult(
@@ -787,7 +896,7 @@ async def update_workspace(
     only_aliases: set[str] | None = None,
     run_hooks: bool = True,
     dry_run: bool = False,
-    commit_depth: int = 500,
+    commit_depth: int = _DEFAULT_COMMIT_LIMIT,
     exclude_patterns: list[str] | None = None,
     include_working_tree: bool = False,
     on_repo_start: Callable[[str], None] | None = None,
@@ -891,6 +1000,15 @@ async def update_workspace(
         # commit-to-commit staleness check above says "up to date" for exactly
         # the work the watcher woke up for.
         if not is_stale and include_working_tree and has_working_tree_changes(abs_path):
+            is_stale = True
+
+        # Rows written under older git history rules: one full walk refreshes
+        # them, as the single-repo update does, even with HEAD unmoved.
+        if (
+            not is_stale
+            and git_history_stale(state)
+            and await _has_persisted_repo_index(abs_path)
+        ):
             is_stale = True
 
         if not is_stale:
@@ -1038,6 +1156,8 @@ async def update_workspace(
                         state["working_tree_paths"] = result.working_tree_paths
                     if result.phase_timings is not None:
                         state["phase_timings"] = result.phase_timings
+                    if result.git_history_refreshed:
+                        state[GIT_HISTORY_VERSION_KEY] = GIT_HISTORY_VERSION
                     # Stamp the config fingerprint so the drift check in
                     # update_single_repo_index stays calibrated (and legacy repos
                     # without one stop re-triggering the full re-index).
@@ -1160,7 +1280,8 @@ async def run_cross_repo_hooks(
     Detects cross-repo co-changes (files committed by the same author within
     a time window across repos) and package/manifest dependencies. Results are
     persisted to ``.repowise-workspace/cross_repo_edges.json`` and loaded by
-    the MCP server's :class:`CrossRepoEnricher` at startup.
+    the MCP server's :class:`CrossRepoEnricher` at startup. Ends by refreshing
+    the workspace store (:mod:`.store`).
     """
     if len(ws_config.repos) < 2:
         return
@@ -1183,6 +1304,45 @@ async def run_cross_repo_hooks(
         await _run_phases(ws_config, workspace_root, changed_repos, timings, workspace_index)
     finally:
         await workspace_index.close()
+
+    # Last: derived components read the system graph the phases just wrote.
+    from .store import refresh_workspace_store
+
+    timings.on_phase_start("workspace_store", None)
+    try:
+        await refresh_workspace_store(ws_config, workspace_root)
+    except Exception:
+        _log.warning("Workspace store refresh failed", exc_info=True)
+    timings.on_phase_done("workspace_store")
+    _log_phase(timings, "workspace_store")
+
+    # Each updated repo snapshotted its components before contracts were
+    # extracted at its new commit; measure them now.
+    for alias in changed_repos:
+        entry = ws_config.get_repo(alias)
+        if entry is not None:
+            await _refresh_contract_facts((workspace_root / entry.path).resolve())
+
+
+async def _refresh_contract_facts(repo_path: Path) -> None:
+    """Best-effort: a failure leaves the run's contracts unavailable."""
+    from ..events.store import refresh_contract_facts
+    from ..persistence import create_engine, create_session_factory, get_session
+    from ..persistence.crud import get_repository_by_path
+    from ..persistence.database import has_db_store, resolve_db_url
+
+    if not has_db_store(repo_path):
+        return
+    engine = create_engine(resolve_db_url(repo_path))
+    try:
+        async with get_session(create_session_factory(engine)) as session:
+            repo = await get_repository_by_path(session, str(repo_path))
+            if repo is not None:
+                await refresh_contract_facts(session, repo.id)
+    except Exception:
+        _log.warning("Contract facts not refreshed for %s", repo_path, exc_info=True)
+    finally:
+        await engine.dispose()
 
 
 async def _run_phases(

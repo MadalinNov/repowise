@@ -15,7 +15,7 @@ import hashlib
 from dataclasses import dataclass
 from typing import Literal
 
-from .change_health.models import ChangeHealthDelta
+from .change_health.models import NOT_ANALYZABLE_DATA, ChangeHealthDelta
 from .health.scoring import ADVISORY_DIMENSION
 
 #: How much of a lane's evidence was actually computed.
@@ -112,13 +112,29 @@ class CoveringTestEvidence:
     #: Uncapped. A surface decides how many to show.
     tests_to_run: tuple[str, ...] = ()
     basis: str | None = None  # measured | inferred | None
+    #: Why every test must run, when nothing narrower can be vouched for.
+    run_all: str | None = None
 
 
 def _plural(word: str, count: int) -> str:
     return word if count == 1 else f"{word}s"
 
 
+def _no_code_headline(delta: ChangeHealthDelta) -> str:
+    if NOT_ANALYZABLE_DATA in delta.skipped.values():
+        return (
+            "No code changed: only query, template or other data files, which health analysis "
+            "does not cover. They can still change behaviour, so test selection still applies."
+        )
+    return (
+        "No code changed: only documentation or configuration files; "
+        "health analysis does not cover them."
+    )
+
+
 def _verdict(delta: ChangeHealthDelta) -> tuple[ReviewStatus, str, EvidenceState]:
+    if delta.status == "unavailable" and delta.skipped and not delta.code_skipped:
+        return "clear_in_analyzed_scope", _no_code_headline(delta), "available"
     if delta.status in _NOT_COMPARED:
         return "unknown", f"Change health could not be compared: {delta.explanation}", "unavailable"
     if delta.status in _UNTRUSTWORTHY:
@@ -168,9 +184,10 @@ def _reasons(delta: ChangeHealthDelta) -> tuple[str, ...]:
         f"{f.symbol or f.path} ({f.attribution_basis})"
         for f in delta.findings
     ]
-    if delta.skipped:
+    skipped = len(delta.code_skipped)
+    if skipped:
         reasons.append(
-            f"{len(delta.skipped)} changed {_plural('file', len(delta.skipped))} "
+            f"{skipped} changed {_plural('file', skipped)} "
             "were not analysed, so this is not a clean bill."
         )
     return tuple(reasons)
@@ -190,7 +207,17 @@ def _actions(delta: ChangeHealthDelta, tests: CoveringTestEvidence) -> tuple[Rev
             )
         )
     next_priority = len(actions)
-    if tests.tests_to_run:
+    if tests.run_all:
+        actions.append(
+            ReviewAction(
+                kind="run_tests",
+                priority=next_priority,
+                evidence_basis=tests.basis,
+                explanation=f"Run every test: {tests.run_all}",
+            )
+        )
+        next_priority += 1
+    elif tests.tests_to_run:
         actions.append(
             ReviewAction(
                 kind="run_tests",
@@ -211,12 +238,12 @@ def _actions(delta: ChangeHealthDelta, tests: CoveringTestEvidence) -> tuple[Rev
             )
         )
         next_priority += 1
-    if delta.skipped:
+    if delta.code_skipped:
         actions.append(
             ReviewAction(
                 kind="review_skipped_files",
                 priority=next_priority,
-                targets=tuple(sorted(delta.skipped)),
+                targets=tuple(sorted(delta.code_skipped)),
                 explanation="Review the skipped files by hand; they were not compared.",
             )
         )

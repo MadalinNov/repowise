@@ -127,9 +127,9 @@ def test_js_suite_and_setup_callbacks_are_not_test_cases() -> None:
     assert "localHelper" not in cases
     assert "it callback" in cases
     assert "test callback" in cases
-    # ``it.each([1,2])`` carries its arguments in the entry name; the first
-    # dotted segment is still the framework function.
-    assert "it.each([1, 2]) callback" in cases
+    # ``it.each([1,2])`` is named by its dotted path, arguments left out; the
+    # first segment is still the framework function.
+    assert "it.each callback" in cases
 
 
 def test_a_language_with_no_row_classifies_nothing() -> None:
@@ -167,6 +167,30 @@ def test_fires_on_a_test_that_asserts_nothing() -> None:
 def test_silent_when_the_test_asserts() -> None:
     _require("python")
     assert _flagged("def test_ok():\n    assert 1 == 1\n") == []
+
+
+def test_silent_on_an_ava_test_that_asserts_on_the_handle() -> None:
+    _require("typescript")
+    source = """
+import test from 'ava';
+test('base url', async t => {
+  t.is(1, 1);
+  t.deepEqual([1], [1]);
+  await t.throwsAsync(() => f());
+});
+"""
+    assert _flagged(source, "test/base-url.ts", "typescript") == []
+
+
+def test_fires_on_an_ava_test_that_only_logs() -> None:
+    _require("typescript")
+    source = """
+import test from 'ava';
+test('logs only', t => {
+  t.log('nothing checked');
+});
+"""
+    assert _flagged(source, "test/logs.ts", "typescript") == ["test callback"]
 
 
 def test_silent_on_a_production_file() -> None:
@@ -852,11 +876,11 @@ def test_an_expect_bound_to_a_const_still_counts_as_checking_something() -> None
 
 
 def test_an_assertion_inside_a_nested_function_helper_is_not_lost() -> None:
-    """A function nested in a test body is collected as nobody's entry.
+    """The test hands its inline helper on and never calls it by name.
 
-    ``_collect_function_nodes`` does not descend past a function, so an inline
-    ``function`` helper is never a walked function of its own, and the counts
-    stop at it. Its calls would otherwise be recorded nowhere at all."""
+    The counts stop at the nested ``function``, whose assertions are its own
+    row's, so the test is answered by the helper's calls rolling up into its
+    own ``called_names``."""
     _require("typescript")
     src = (
         "it('checks in a helper', () => {\n"

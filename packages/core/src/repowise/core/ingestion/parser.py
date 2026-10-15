@@ -55,12 +55,14 @@ from .extractors import (
     refine_go_type_kind,
     refine_kotlin_class_kind,
     refine_pascal_type_kind,
+    refine_swift_class_kind,
 )
 from .extractors.bindings.elixir import elixir_import_modules
 from .extractors.bindings.python import expand_bare_relative_imports
 from .extractors.bindings.ts_js import (
     declarator_binds_callable,
     declarator_value_is_module_ref,
+    dynamic_import_bindings,
 )
 from .extractors.synthetic_symbols import extract_synthetic_symbols
 from .extractors.visibility import (
@@ -84,10 +86,13 @@ from .models import (
     ParsedFile,
     Symbol,
     TypeReference,
+    combine_load_kinds,
     compute_content_hash,
 )
 from .parser_helpers import (
     TYPE_HEAD_EXTRACTORS,
+    _argument_literal_types,
+    _argument_names,
     _build_qualified_name,
     _classify_param_origin,
     _collect_error_nodes,
@@ -108,20 +113,29 @@ from .parser_helpers import (
     _has_callable_ancestor,
     _head_type_identifier,
     _is_async_node,
+    _kotlin_receiver_fields,
     _objc_call_is_block_variable,
     _objc_container_node,
     _objc_container_parent,
     _objc_is_macro_enum,
     _objc_message_selector,
     _objc_symbol_name,
+    _overload_arguments,
     _qualified_cpp_parent,
     _qualified_pascal_parent,
     _run_query,
     _rust_shadowed_by_type_param,
     _ts_nested_object_method_owner,
+    follow_renamed_hosts,
+    import_load_kind,
+    in_anonymous_class,
+    is_anonymous_member,
+    scope_segment,
 )
-from .python_local_refs import extract_python_local_refs
+from .python_local_refs import local_refs_from_tree, parse_python_module
 from .python_overload import is_python_overload as _is_python_overload
+from .python_registrars import registering_functions
+from .python_tasks import is_fire_and_forget
 from .sfc_source import component_call_sites, prepare_source
 from .special_handlers import SPECIAL_HANDLER_LANGUAGES, parse_special
 from .symbol_identity import disambiguate_colliding_ids, symbol_discriminator
@@ -150,8 +164,29 @@ _TS_JS_LANGUAGES = ("typescript", "javascript", "svelte", "vue")
 
 # Languages whose query defines the ``@reference.*`` captures. Every other
 # language would only scan the whole match list to find nothing, so the check
-# is here rather than inside ``_extract_references``.
-_REFERENCE_LANGUAGES = ("cpp", "c", "go", "rust", "kotlin")
+# is here rather than inside ``_extract_references``. The SFC tags reuse the
+# TS captures but stay out: resolution has no local-shadow scan for them.
+_REFERENCE_LANGUAGES = ("cpp", "c", "go", "rust", "kotlin", "typescript", "javascript", "python")
+
+# Languages where a bare name resolves only through the file's own symbols or
+# a name it imports, so any other bare name cannot pass the reference floor.
+_NAMED_BINDING_LANGUAGES = frozenset({"typescript", "javascript", "python"})
+
+
+def _bare_reference_names(
+    language: str, symbols: list[Symbol], imports: list[Import]
+) -> frozenset[str] | None:
+    """Names a receiver-less reference in this file could resolve to, or None for any.
+
+    Most bare identifiers in a value position are locals; dropping them here
+    skips their per-site work. A wildcard import keeps every name.
+    """
+    if language not in _NAMED_BINDING_LANGUAGES:
+        return None
+    imported = {name for imp in imports for name in imp.local_names}
+    if "*" in imported:
+        return None
+    return frozenset(imported.union(s.name for s in symbols))
 
 
 def _call_receiver_from_node(node: Node, src: str) -> CallReceiver | None:
@@ -162,6 +197,8 @@ def _call_receiver_from_node(node: Node, src: str) -> CallReceiver | None:
     which call is carried into resolution.
     """
 
+    if node.type == "identifier":
+        return _dart_call_receiver(node, src)
     arguments = node.child_by_field_name("arguments")
     argument_count = _count_arguments(arguments) if arguments is not None else None
 
@@ -179,6 +216,19 @@ def _call_receiver_from_node(node: Node, src: str) -> CallReceiver | None:
                 (child for child in function.named_children if child.type == "identifier"), None
             )
             receiver = None
+        elif function.type == "attribute":
+            # Python ``obj.m()``: the receiver is kept as a plain dotted path,
+            # and a call on anything else is not carried at all.
+            target = function.child_by_field_name("attribute")
+            obj = function.child_by_field_name("object")
+            path = (
+                _receiver_text("python", obj, src)
+                if obj is not None and obj.type in ("identifier", "attribute")
+                else None
+            )
+            if target is None or path is None:
+                return None
+            return CallReceiver(_node_text(target, src).strip(), path, argument_count)
         else:
             target = (
                 function.child_by_field_name("name")
@@ -202,6 +252,34 @@ def _call_receiver_from_node(node: Node, src: str) -> CallReceiver | None:
     if receiver is not None and receiver.type in ("identifier", "this"):
         receiver_name = _node_text(receiver, src).strip() or None
     return CallReceiver(target_name, receiver_name, argument_count)
+
+
+def _dart_call_receiver(name: Node, src: str) -> CallReceiver | None:
+    """The Dart call whose *name* the query captured: ``a.b(..)``, ``B(..)``.
+
+    A Dart call is a flat selector run with no call node, so the name's
+    siblings are read: the selector after it holds the arguments, and the
+    node before a ``.b`` selector is its receiver.
+    """
+    if name.parent.type == "unconditional_assignable_selector":
+        head = name.parent.parent
+        prev = head.prev_named_sibling
+        if prev is not None and any(c.type == "argument_part" for c in prev.named_children):
+            receiver = None
+        else:
+            receiver = _node_text(prev, src).strip() if prev is not None else None
+    else:
+        head, receiver = name, None
+    return CallReceiver(
+        _node_text(name, src).strip(), receiver, _dart_argument_count(head.next_named_sibling)
+    )
+
+
+def _dart_argument_count(selector: Node | None) -> int | None:
+    """The arguments a Dart ``(selector (argument_part (arguments)))`` passes."""
+    parts = selector.named_children if selector is not None else ()
+    found = [arg for part in parts for arg in part.named_children if arg.type == "arguments"]
+    return _count_arguments(found[0]) if found else None
 
 
 @cache
@@ -438,6 +516,10 @@ def _receiver_text(language: str, node: Node, src: str) -> str | None:
     names: a call, subscript or optional hop inside it types nothing, and
     dropping the site keeps it off the bare-call tiers.
     """
+    sibling = node.next_named_sibling
+    if language == "java" and node.type != "super" and getattr(sibling, "type", None) == "super":
+        # ``S.super.m()``: ``S`` qualifies the ``super`` its own pattern captures.
+        return None
     text = _node_text(node, src).strip()
     if (language, node.type) not in _PATH_RECEIVERS:
         return text
@@ -539,6 +621,16 @@ def _keep_ts_overloads_beside_a_body(symbols: list[Symbol], node_types: list[str
         for s, t in zip(symbols, node_types, strict=True)
         if t not in _TS_OVERLOAD_SIGNATURES or s.id in bodied
     ]
+
+
+def _drop_swift_extensions_of_local_types(symbols: list[Symbol]) -> list[Symbol]:
+    """Drop an ``extension`` of a type the same file declares.
+
+    It shares the type's id, so it would replace the type's node and kind; its
+    members already name the type as their parent.
+    """
+    declared = {s.id for s in symbols if s.kind != "impl"}
+    return [s for s in symbols if s.kind != "impl" or s.id not in declared]
 
 
 def _is_declaration(
@@ -697,6 +789,9 @@ def _refine_symbol_kind(
     if kind == "class" and language == "kotlin" and node_type == "class_declaration":
         kind = refine_kotlin_class_kind(def_node)
 
+    if kind == "class" and language == "swift" and node_type == "class_declaration":
+        kind = refine_swift_class_kind(def_node)
+
     # Pascal ``declType`` wraps class, record, interface, enum and more.
     if kind == "class" and language == "pascal" and node_type == "declType":
         kind = refine_pascal_type_kind(def_node)
@@ -848,10 +943,16 @@ def _rust_outer_attributes(def_node: Node, src: str) -> list[str]:
 def _leading_child_attributes(
     def_node: Node, node_type: str, opener: str, closer: str, src: str
 ) -> list[str]:
-    """Inner text of the attribute children leading *def_node*, until the first other child."""
+    """Inner text of the attribute children leading *def_node*, until the first other child.
+
+    A comment between attribute lists does not end the run, so an attribute
+    placed after one is still recorded.
+    """
     attrs: list[str] = []
     for child in def_node.children:
         if child.type != node_type:
+            if child.type == "comment":
+                continue
             break
         attr_text = _node_text(child, src).strip()
         if attr_text.startswith(opener) and attr_text.endswith(closer):
@@ -1029,7 +1130,8 @@ def _statement_imports(
         return macro_mod_imports(module_node, raw) if "mod" in raw else []
     if language in _TS_JS_LANGUAGES and _is_dynamic_esm_import(stmt_node):
         # ``import('./mod')`` binds a module namespace at runtime, so it is a
-        # wildcard, which keeps the target's exports live.
+        # wildcard, which keeps the target's exports live. The names it is
+        # destructured into still bind, for call resolution.
         return [
             Import(
                 raw_statement=raw,
@@ -1037,7 +1139,7 @@ def _statement_imports(
                 imported_names=["*"],
                 is_relative=module_text.startswith("."),
                 resolved_file=None,
-                bindings=[],
+                bindings=dynamic_import_bindings(stmt_node, src),
                 is_reexport=False,
             )
         ]
@@ -1178,6 +1280,7 @@ def _generic_import(
         or module_text.startswith("./")
         or module_text.startswith(("self::", "super::", "crate::"))
     )
+    # ``type_only`` / ``deferred`` are set by the caller from ``import_load_kind``.
     return Import(
         raw_statement=raw,
         module_path=module_text,
@@ -1284,6 +1387,118 @@ def _is_reexport_import(stmt_node: Node, raw: str, language: str) -> bool:
     return language == "swift" and raw.startswith("@_exported")
 
 
+def _parse_tree(
+    lang: str, language: Language, grammar_tag: str, source: bytes
+) -> tuple[Node, list[str], str, Language]:
+    """``(root, parse errors, grammar tag, language)``; a JSX-bearing ``.ts`` retries as TSX."""
+    parser = Parser(language)
+    tree = parser.parse(source)
+    root = tree.root_node
+
+    parse_errors = _collect_error_nodes(root)
+
+    # Adaptive TSX grammar fallback: if a .ts file contains JSX markup,
+    # tree-sitter-typescript produces ERROR nodes. Re-parse using the TSX
+    # grammar ONLY IF:
+    #   1. Initial parse yielded error nodes (parse_errors is non-empty)
+    #   2. The file projects to TypeScript and is not already on tsx
+    #   3. Source contains JSX-specific closing tokens (b"/>" or b"</")
+    # A .vue render function may be written in JSX
+    # (``vnodes.push(<i class={c} />)``), which is the single TS parse
+    # failure across a 1,593-file .vue corpus. ``source`` here is the
+    # markup-blanked projection, so the template's own ``</`` and ``/>``
+    # are already spaces — the token test still keys on real JSX only.
+    # The swap is strictly safe: it only takes effect when TSX yields
+    # FEWER errors than the first parse.
+    if (
+        parse_errors
+        and lang in ("typescript", "vue")
+        and grammar_tag != "tsx"
+        and (b"/>" in source or b"</" in source)
+    ):
+        tsx_language = _get_language("tsx")
+        if tsx_language is not None:
+            tsx_tree = Parser(tsx_language).parse(source)
+            tsx_errors = _collect_error_nodes(tsx_tree.root_node)
+            if len(tsx_errors) < len(parse_errors):
+                tree = tsx_tree
+                root = tree.root_node
+                parse_errors = tsx_errors
+                # Both grammar_tag AND language must be reassigned.
+                # grammar_tag is consumed immediately below by
+                # the caller's _get_query(lang, language, grammar_tag), which
+                # appends tsx.scm to the base typescript.scm query.
+                # That append is what supplies the
+                # jsx_opening_element / jsx_self_closing_element captures
+                # that restore JSX component call-site edges.
+                # Reassigning only ``tree`` / ``root`` would fix parse
+                # errors but leave those edges missing — the dead-code
+                # false-positive would remain.
+                grammar_tag = "tsx"
+                language = tsx_language
+    return root, parse_errors, grammar_tag, language
+
+
+def _parent_type_name(ancestor: Node, src: str) -> str | None:
+    """The name a class/impl ancestor gives its members, without type arguments."""
+    name_node = ancestor.child_by_field_name("name") or (
+        ancestor.child_by_field_name("type")  # Rust impl_item
+    )
+    if name_node is None:
+        return None
+    # For Rust impl blocks with generic types (e.g. impl<T> Foo<T>),
+    # extract only the base type name, not the full generic signature.
+    if name_node.type in ("generic_type", "scoped_type_identifier"):
+        inner = name_node.child_by_field_name(
+            "type" if name_node.type == "generic_type" else "name"
+        )
+        if inner and inner.type == "type_identifier":
+            name_node = inner
+    return _node_text(name_node, src)
+
+
+def _nesting_parent(def_node: Node, config: LanguageConfig, src: str) -> str | None:
+    """The class/impl ancestor naming *def_node*'s parent.
+
+    An anonymous class is a class of its own, so its members gain segments
+    below it: ``Gson::FILTER::Filter::check``.
+    """
+    segments: list[str] = []
+    child, ancestor = def_node, def_node.parent
+    while ancestor is not None:
+        if ancestor.type in config.parent_class_types:
+            name = _parent_type_name(ancestor, src)
+            if name is not None:
+                return "::".join([name, *reversed(segments)])
+        else:
+            segment = scope_segment(
+                ancestor, child, bool(segments), config.anonymous_class_types, src
+            )
+            if segment is not None:
+                segments.append(segment)
+        child, ancestor = ancestor, ancestor.parent
+    # A Kotlin top-level function's object expression: ``f::Foo``.
+    return "::".join(reversed(segments)) or None
+
+
+def _java_enum_constant(def_node: Node, config: LanguageConfig, src: str) -> str | None:
+    """The enum constant whose body declares *def_node*, before any enclosing type.
+
+    An anonymous class is such a type: ``_find_parent`` names its members.
+    """
+    ancestor = def_node.parent
+    while (
+        ancestor is not None
+        and ancestor.type not in config.parent_class_types
+        and ancestor.type not in config.anonymous_class_types
+    ):
+        if ancestor.type == "enum_constant":
+            name = ancestor.child_by_field_name("name")
+            return _node_text(name, src) if name else None
+        ancestor = ancestor.parent
+    return None
+
+
 class ASTParser:
     """Unified AST parser — works for all languages via .scm query files.
 
@@ -1300,6 +1515,31 @@ class ASTParser:
 
     def __init__(self) -> None:
         pass
+
+    def parse_imports(self, file_info: FileInfo, source: bytes) -> list[Import]:
+        """Only *source*'s imports: :meth:`parse_file`'s grammar, query and import pass.
+
+        Symbols, calls and references are not extracted, which is most of a
+        parse. A language without a tree-sitter path takes the full parse.
+        """
+        lang = file_info.language
+        config = LANGUAGE_CONFIGS.get(lang)
+        grammar_tag = grammar_tag_for(lang, file_info.path)
+        language = _get_language(grammar_tag)
+        signature_file = lang == "fsharp" and file_info.path.endswith(".fsi")
+        if (
+            lang in SPECIAL_HANDLER_LANGUAGES
+            or config is None
+            or language is None
+            or signature_file
+        ):
+            return self.parse_file(file_info, source).imports
+        source = prepare_source(lang, source, path=file_info.path)
+        root, _, grammar_tag, language = _parse_tree(lang, language, grammar_tag, source)
+        query = self._get_query(lang, language, grammar_tag)
+        matches = _run_query(query, root) if query is not None else []
+        src = source.decode("utf-8", errors="replace")
+        return self._extract_imports(matches, config, file_info, src)
 
     def parse_file(self, file_info: FileInfo, source: bytes) -> ParsedFile:
         """Parse *source* bytes and return a fully populated ParsedFile."""
@@ -1367,52 +1607,8 @@ class ASTParser:
         original_source = source
         source = prepare_source(lang, source, path=file_info.path)
 
-        parser = Parser(language)
-        tree = parser.parse(source)
+        root, parse_errors, grammar_tag, language = _parse_tree(lang, language, grammar_tag, source)
         src = source.decode("utf-8", errors="replace")
-        root = tree.root_node
-
-        parse_errors = _collect_error_nodes(root)
-
-        # Adaptive TSX grammar fallback: if a .ts file contains JSX markup,
-        # tree-sitter-typescript produces ERROR nodes. Re-parse using the TSX
-        # grammar ONLY IF:
-        #   1. Initial parse yielded error nodes (parse_errors is non-empty)
-        #   2. The file projects to TypeScript and is not already on tsx
-        #   3. Source contains JSX-specific closing tokens (b"/>" or b"</")
-        # A .vue render function may be written in JSX
-        # (``vnodes.push(<i class={c} />)``), which is the single TS parse
-        # failure across a 1,593-file .vue corpus. ``source`` here is the
-        # markup-blanked projection, so the template's own ``</`` and ``/>``
-        # are already spaces — the token test still keys on real JSX only.
-        # The swap is strictly safe: it only takes effect when TSX yields
-        # FEWER errors than the first parse.
-        if (
-            parse_errors
-            and lang in ("typescript", "vue")
-            and grammar_tag != "tsx"
-            and (b"/>" in source or b"</" in source)
-        ):
-            tsx_language = _get_language("tsx")
-            if tsx_language is not None:
-                tsx_tree = Parser(tsx_language).parse(source)
-                tsx_errors = _collect_error_nodes(tsx_tree.root_node)
-                if len(tsx_errors) < len(parse_errors):
-                    tree = tsx_tree
-                    root = tree.root_node
-                    parse_errors = tsx_errors
-                    # Both grammar_tag AND language must be reassigned.
-                    # grammar_tag is consumed immediately below by
-                    # self._get_query(lang, language, grammar_tag), which
-                    # appends tsx.scm to the base typescript.scm query.
-                    # That append is what supplies the
-                    # jsx_opening_element / jsx_self_closing_element captures
-                    # that restore JSX component call-site edges.
-                    # Reassigning only ``tree`` / ``root`` would fix parse
-                    # errors but leave those edges missing — the dead-code
-                    # false-positive would remain.
-                    grammar_tag = "tsx"
-                    language = tsx_language
 
         query = self._get_query(lang, language, grammar_tag)
 
@@ -1435,8 +1631,12 @@ class ASTParser:
             existing = {(s.id, symbol_discriminator(s)) for s in symbols}
             symbols.extend(s for s in synthetic if (s.id, symbol_discriminator(s)) not in existing)
         # Before calls and references are extracted, so both attribute to the
-        # final ids.
-        disambiguate_colliding_ids(symbols, lang)
+        # final ids. Anonymous members go last, once the overloads holding them
+        # carry their discriminators.
+        anonymous = [s for s in symbols if is_anonymous_member(s)]
+        disambiguate_colliding_ids([s for s in symbols if not is_anonymous_member(s)], lang)
+        follow_renamed_hosts(symbols)
+        disambiguate_colliding_ids(anonymous, lang)
         imports = self._extract_imports(matches, config, file_info, src)
         calls = self._extract_calls(matches, config, file_info, src, symbols)
         # An SFC instantiates a component by writing its tag in the markup
@@ -1446,7 +1646,7 @@ class ASTParser:
         # every non-SFC language.
         calls.extend(component_call_sites(lang, original_source, symbols))
         references = (
-            self._extract_references(matches, file_info, src, symbols)
+            self._extract_references(matches, file_info, src, symbols, imports)
             if lang in _REFERENCE_LANGUAGES
             else []
         )
@@ -1461,13 +1661,9 @@ class ASTParser:
         # (callable passed as an arg, type annotation, decorator, default)
         # carry no graph edge, so the dead-code unused-export pass would flag
         # them. Stamp the referenced names so the analyzer can rescue them.
-        local_refs: frozenset[str] = frozenset()
-        if lang == "python":
-            top_level_names = {s.name for s in symbols if s.name and not s.parent_name}
-            nested_classes = {
-                (s.parent_name, s.name) for s in symbols if s.kind == "class" and s.parent_name
-            }
-            local_refs = extract_python_local_refs(src, top_level_names, nested_classes)
+        local_refs, registrars = (
+            _python_module_facts(src, symbols) if lang == "python" else (frozenset(), frozenset())
+        )
 
         if len(symbols) > _SYMBOL_COUNT_WARN_THRESHOLD:
             log.warning(
@@ -1491,6 +1687,7 @@ class ASTParser:
             content_hash=content_hash,
             type_refs=type_refs,
             local_refs=local_refs,
+            registrars=registrars,
             references=references,
         )
 
@@ -1568,6 +1765,9 @@ class ASTParser:
         if language in _TS_JS_LANGUAGES:
             symbols = _keep_ts_overloads_beside_a_body(symbols, node_types)
 
+        if language == "swift":
+            symbols = _drop_swift_extensions_of_local_types(symbols)
+
         # A .m file routinely declares its private methods in a class
         # extension and defines them below in the @implementation, which
         # builds each symbol id twice in one file.
@@ -1612,7 +1812,10 @@ class ASTParser:
             language,
             src,
             cpp_exports.container_ids,
-            keep_nested=object_owner is not None,
+            # An anonymous class member is a method of its own class, even
+            # inside another method's body; ``_find_parent`` names it.
+            keep_nested=object_owner is not None
+            or in_anonymous_class(def_node, config.anonymous_class_types),
         )
         if kind is None:
             return None
@@ -1664,15 +1867,15 @@ class ASTParser:
 
         params_nodes = capture_dict.get("symbol.params", [])
         params_text = _node_text(params_nodes[0], src) if params_nodes else ""
-        sym_id = (
-            f"{file_info.path}::{parent_name}::{name}"
-            if parent_name
-            else f"{file_info.path}::{name}"
-        )
+        # The id scope adds a Java enum constant to its parent, so each
+        # constant's override is its own node while the enum stays its owner.
+        constant = _java_enum_constant(def_node, config, src) if language == "java" else None
+        scope = f"{parent_name}::{constant}" if parent_name and constant else parent_name
+        sym_id = f"{file_info.path}::{scope}::{name}" if scope else f"{file_info.path}::{name}"
         symbol = Symbol(
             id=sym_id,
             name=name,
-            qualified_name=_build_qualified_name(file_info.path, parent_name, name),
+            qualified_name=_build_qualified_name(file_info.path, scope, name),
             kind=kind,  # type: ignore[arg-type]
             signature=build_signature(node_type, name, params_text, def_node, src),
             start_line=start_line,
@@ -1691,6 +1894,7 @@ class ASTParser:
             type_parameter_count=(
                 _csharp_type_parameter_count(def_node) if language == "csharp" else None
             ),
+            **_kotlin_receiver_fields(def_node, params_nodes, language, name),
             modifiers=_declared_modifiers(def_node, config.modifier_node_types, src),
         )
         return symbol, def_node
@@ -1793,27 +1997,7 @@ class ASTParser:
             return None
 
         if config.parent_extraction in ("nesting", "impl"):
-            # Walk up the AST to find a class/impl ancestor
-            ancestor = def_node.parent
-            while ancestor is not None:
-                if ancestor.type in config.parent_class_types:
-                    name_node = ancestor.child_by_field_name("name") or (
-                        ancestor.child_by_field_name("type")  # Rust impl_item
-                    )
-                    if name_node:
-                        # For Rust impl blocks with generic types (e.g. impl<T> Foo<T>),
-                        # extract only the base type name, not the full generic signature.
-                        if name_node.type == "generic_type":
-                            inner = name_node.child_by_field_name("type")
-                            if inner and inner.type == "type_identifier":
-                                name_node = inner
-                        elif name_node.type == "scoped_type_identifier":
-                            inner = name_node.child_by_field_name("name")
-                            if inner and inner.type == "type_identifier":
-                                name_node = inner
-                        return _node_text(name_node, src)
-                ancestor = ancestor.parent
-            return None
+            return _nesting_parent(def_node, config, src)
 
         return None  # "none" mode
 
@@ -1831,6 +2015,9 @@ class ASTParser:
         language = file_info.language
         imports: list[Import] = []
         seen_raws: set[str] = set()
+        # Statement key -> the Imports it produced, so a repeat folds its load
+        # kind into them rather than adding a duplicate.
+        seen_imports: dict[str, list[Import]] = {}
         seen_pascal_units: set[str] = set()
         seen_elixir_modules: set[str] = set()
 
@@ -1868,17 +2055,29 @@ class ASTParser:
                 mod_path_attr = _rust_mod_path_attribute(stmt_node, src)
                 if mod_path_attr is not None:
                     dedup_key = f"{raw}|path={mod_path_attr}"
-            if dedup_key in seen_raws:
+            # Two ``import('./m')`` calls share their text but not the names
+            # each one binds.
+            if language in _TS_JS_LANGUAGES and _is_dynamic_esm_import(stmt_node):
+                dedup_key = f"{raw}|at={stmt_node.start_byte}"
+            kind = import_load_kind(stmt_node, language, src)
+            if dedup_key in seen_imports:
+                # A lazy copy must not hide a load-time twin: runtime wins.
+                for imp in seen_imports[dedup_key]:
+                    imp.type_only, imp.deferred = combine_load_kinds(
+                        (imp.type_only, imp.deferred), kind
+                    )
                 continue
-            seen_raws.add(dedup_key)
+            seen_imports[dedup_key] = []
 
             module_text = _node_text(module_nodes[0], src).strip().strip("\"'` ")
             if not module_text:
                 continue
 
-            imports.extend(
-                _statement_imports(stmt_node, module_nodes[0], module_text, raw, language, src)
-            )
+            found = _statement_imports(stmt_node, module_nodes[0], module_text, raw, language, src)
+            for imp in found:
+                imp.type_only, imp.deferred = kind
+            seen_imports[dedup_key] = found
+            imports.extend(found)
 
         if language == "python":
             imports = expand_bare_relative_imports(imports)
@@ -1973,6 +2172,7 @@ class ASTParser:
 
             arg_count = _count_arguments(arg_nodes[0]) if arg_nodes else None
             caller_id = _find_enclosing_symbol(line, symbol_ranges)
+            arguments = _overload_arguments(file_info.language, arg_nodes)
 
             calls.append(
                 (
@@ -1984,6 +2184,8 @@ class ASTParser:
                         line=line,
                         argument_count=arg_count,
                         receiver_call=receiver_call,
+                        argument_types=_argument_literal_types(arguments, src),
+                        argument_names=_argument_names(arguments, src),
                         scope_name=scope_name,
                         edge_type=(
                             "references"
@@ -1991,6 +2193,11 @@ class ASTParser:
                             else "calls"
                         ),
                         supplied_props=_jsx_supplied_props(site_node, src),
+                        # Ceiling: schedulers matched by name, the task followed
+                        # within its own function only (see ``python_tasks``).
+                        spawned=(
+                            file_info.language == "python" and is_fire_and_forget(site_node, src)
+                        ),
                     ),
                 )
             )
@@ -2002,6 +2209,7 @@ class ASTParser:
         file_info: FileInfo,
         src: str,
         symbols: list[Symbol],
+        imports: list[Import],
     ) -> list[CallSite]:
         """Extract sites that name a function without calling it.
 
@@ -2011,6 +2219,8 @@ class ASTParser:
         initialiser, and a ``::`` callable reference. Each leaves the named
         function with no inbound edge, which read as a ``safe_to_delete``
         unused export and took out whole handler and interop layers (#1602).
+        TS/JS and Python capture any value position: an argument, a list or
+        object entry, a return, an assignment and a default export.
 
         ``@reference.receiver`` is optional; capturing it is what lets
         ``_add_reference_edges`` restrict a bare name to free functions and
@@ -2045,6 +2255,7 @@ class ASTParser:
             key=lambda t: (t[0], -t[1]),
         )
         callable_ids = {s.id for s in symbols if s.kind in ("function", "method")}
+        bindable = _bare_reference_names(file_info.language, symbols, imports)
 
         references: list[CallSite] = []
         seen: set[tuple[int, str, str | None]] = set()
@@ -2074,6 +2285,8 @@ class ASTParser:
             for name_node, is_table in candidates:
                 name = _node_text(name_node, src).strip()
                 if not name or name in builtins:
+                    continue
+                if bindable is not None and receiver is None and name not in bindable:
                     continue
                 line = name_node.start_point[0] + 1
                 enclosing = _find_enclosing_symbol(line, symbol_ranges)
@@ -2174,6 +2387,26 @@ class ASTParser:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_PARSER: ASTParser | None = None
+
+
+def _python_module_facts(
+    src: str, symbols: list[Symbol]
+) -> tuple[frozenset[str], frozenset[str]]:
+    """``(local_refs, registrars)`` for a Python module, from one ``ast`` parse.
+
+    See ``python_local_refs`` and ``python_registrars``.
+    """
+    top_level_names = {s.name for s in symbols if s.name and not s.parent_name}
+    tree = parse_python_module(src) if top_level_names else None
+    if tree is None:
+        return frozenset(), frozenset()
+    nested_classes = {
+        (s.parent_name, s.name) for s in symbols if s.kind == "class" and s.parent_name
+    }
+    return (
+        local_refs_from_tree(tree, top_level_names, nested_classes),
+        registering_functions(tree),
+    )
 
 
 def parse_file(file_info: FileInfo, source: bytes) -> ParsedFile:

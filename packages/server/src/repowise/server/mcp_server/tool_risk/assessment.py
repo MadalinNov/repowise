@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
+import math
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -11,11 +13,11 @@ from typing import Any
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from repowise.core.analysis.health.engine import _has_paired_test_file, _path_basenames
+from repowise.core.analysis.pr_blast import untested_files
+from repowise.core.analysis.security_scan import SYMBOL_NAME_KINDS
 from repowise.core.co_change import confidence_ratio, parse_partners
 from repowise.core.persistence.models import (
     GitMetadata,
-    GraphNode,
     Repository,
 )
 from repowise.server.mcp_server._budget import OmissionCollector, cap_collection
@@ -23,7 +25,8 @@ from repowise.server.mcp_server._helpers import (
     filter_dicts_by_key,
     is_excluded,
 )
-from repowise.server.repo_paths import normalize_target_path
+from repowise.server.mcp_server._meta import served_root
+from repowise.server.repo_paths import missing_path_hint, normalize_target_path
 
 #: A file carrying this many counted bug fixes reads as bug-prone. Same trigger
 #: the PR bot uses for prior defects, so the two surfaces agree on "a lot".
@@ -237,64 +240,16 @@ def _compute_impact_surface(
 
 
 async def _check_test_gap(session: AsyncSession, repo_id: str, target: str) -> bool:
-    """Return True if *target* has no test, coverage-backed where the map has data.
-
-    Three signals, in descending order of what they can prove, and the file is a
-    gap only when all three stay silent - the same ladder ``pr_blast``
-    ``_find_test_gaps`` uses, because the two answered this question differently
-    and a reader has no way to tell which one they are looking at.
-
-    1. A per-test coverage row (from ``repowise coverage add``) is
-       execution-proof: never a gap.
-    2. A test file reaching it in the dependency graph is evidence, not proof,
-       but a recorded edge rather than a guess - it catches the suites whose
-       tests are named for behaviour rather than for the file under test.
-    3. Otherwise the filename pattern (test_<name>, <name>_test, <name>.spec.*)
-       - an honest "unknown", never asserted as untested.
-
-    Test files themselves (is_test=True) are never a gap.
-    """
-    from repowise.core.persistence.crud import covered_source_files
-
-    # Test files don't need tests — skip the check entirely
-    node_res = await session.execute(
-        select(GraphNode.is_test)
-        .where(
-            GraphNode.repository_id == repo_id,
-            GraphNode.node_id == target,
-        )
-        .limit(1)
-    )
-    row = node_res.scalar_one_or_none()
-    if row is True:
-        return False
-
-    # Coverage proves a test exercises this file: not a gap.
-    if await covered_source_files(session, repo_id, {target}):
-        return False
-
-    # The graph records a test reaching it: not a gap either. Degrades to "no
-    # signal" rather than raising - a failed walk must not become an accusation.
-    from repowise.core.analysis.test_reachability import tests_reaching
-
-    try:
-        if await tests_reaching(session, repo_id, [target]):
-            return False
-    except Exception:
-        pass
-
-    test_nodes = await session.execute(
-        select(GraphNode.node_id).where(
-            GraphNode.repository_id == repo_id,
-            GraphNode.is_test == True,  # noqa: E712
-        )
-    )
-    test_basenames = _path_basenames(set(test_nodes.scalars()))
-    return not _has_paired_test_file(target, test_basenames)
+    """Whether nothing can be shown to test *target* (``pr_blast.untested_files``)."""
+    return bool(await untested_files(session, repo_id, [target]))
 
 
 async def _get_security_signals(session: AsyncSession, repo_id: str, target: str) -> list[dict]:
-    """Fetch stored security findings for *target* from security_findings table."""
+    """Fetch stored security findings for *target* from security_findings table.
+
+    Symbol-name rows stay stored for the dashboard; next to real findings they
+    only read as alarms, so an agent never sees them.
+    """
     try:
         rows = await session.execute(
             text(
@@ -305,22 +260,13 @@ async def _get_security_signals(session: AsyncSession, repo_id: str, target: str
             ),
             {"repo_id": repo_id, "fp": target},
         )
-        return [{"kind": r[0], "severity": r[1], "snippet": r[2]} for r in rows.all()]
+        return [
+            {"kind": r[0], "severity": r[1], "snippet": r[2]}
+            for r in rows.all()
+            if r[0] not in SYMBOL_NAME_KINDS
+        ]
     except Exception:
         return []
-
-
-def _co_change_direction(conf_ab: float | None, conf_ba: float | None) -> str:
-    """Which side of a pair leads, where ``a`` is the target and ``b`` the partner.
-
-    A higher ``conf_ab`` means the target seldom changes without the partner, so
-    the target is the antecedent. Equal confidences, or an index written before
-    the two commit totals were recorded, stay ``undirected`` rather than having
-    a lead broken arbitrarily.
-    """
-    if conf_ab is None or conf_ba is None or conf_ab == conf_ba:
-        return "undirected"
-    return "a_to_b" if conf_ab > conf_ba else "b_to_a"
 
 
 def _build_co_changes(
@@ -331,12 +277,9 @@ def _build_co_changes(
     Larger lists make MCP responses verbose without adding signal: top-5 captures
     the bulk of the temporal-coupling mass and keeps tool output tight for agents.
 
-    The strength field is emitted as ``weight``, not ``count``: the stored value
-    is a recency-decayed sum (``exp(-age_days / tau)`` per shared commit), so it
-    is fractional. Named ``count`` it read as "5.52 co-changes" to every agent.
-
-    ``conf_ab`` and ``conf_ba`` are the two directional confidences behind
-    ``direction``, omitted when the commit totals are unknown.
+    Row order stays by recency-decayed ``weight``. Each row carries ``file_path``,
+    ``support`` (shared commit count, when known), ``conf_ab`` (share of target's
+    commits that touched partner, when known), and ``has_import_link``.
     """
     partners_sorted = parse_partners(meta.co_change_partners_json)
     relation_types = structural_related if isinstance(structural_related, dict) else {}
@@ -346,37 +289,23 @@ def _build_co_changes(
         path = partner.file_path
         types = sorted(relation_types.get(path, ()))
         conf_ab = confidence_ratio(partner.support, partner.self_commits)
-        conf_ba = confidence_ratio(partner.support, partner.partner_commits)
-        row = {
+        row: dict[str, Any] = {
             "file_path": path,
-            "weight": partner.weight,
-            "last_co_change": partner.last_co_change,
-            "relationship_type": "co_change",
-            "direction": _co_change_direction(conf_ab, conf_ba),
-            "evidence_kind": "historical",
-            "provenance": "git_history",
-            "has_structural_link": path in related_paths,
-            # Compatibility field: unlike the broader structural flag, this is
-            # true only for an actual imports edge.
             "has_import_link": "imports" in types if types else path in related_paths,
         }
-        if types:
-            row["structural_relationship_types"] = types
         if partner.support:
             row["support"] = partner.support
         if conf_ab is not None:
             row["conf_ab"] = conf_ab
-        if conf_ba is not None:
-            row["conf_ba"] = conf_ba
         rows.append(row)
     population = filter_dicts_by_key(rows, "file_path", exclude_spec)
     return population, len(population)
 
 
-def fix_annotation(meta: Any) -> dict | None:
-    """Counted fixes, their age, and the magnet flag, or ``None`` for silence.
+def fix_annotation(meta: Any, now: datetime | None = None) -> dict | None:
+    """The shared count/age/magnet fix block used by context and risk.
 
-    The compact form every fix-history surface shares, so the recency contract
+    Centralized so the two tools agree on the wire format and the age contract
     is enforced once: the ``bug_magnet`` flag rides on the age and is never
     emitted alone. ``bug_magnet`` is a claim about RECENT fix pressure, so with
     no timestamp to anchor it the same word would describe a file fixed four
@@ -392,8 +321,13 @@ def fix_annotation(meta: Any) -> dict | None:
     last_fix_at = getattr(meta, "last_fix_at", None)
     if isinstance(last_fix_at, datetime):
         # Rows are stored naive-UTC; compare on the same footing.
+        ref = (
+            datetime.now(UTC)
+            if now is None
+            else (now if now.tzinfo else now.replace(tzinfo=UTC))
+        )
         moment = last_fix_at if last_fix_at.tzinfo else last_fix_at.replace(tzinfo=UTC)
-        out["last_fix_days_ago"] = max(0, (datetime.now(UTC) - moment).days)
+        out["last_fix_days_ago"] = max(0, (ref - moment).days)
         if getattr(meta, "bug_magnet", False):
             out["bug_magnet"] = True
     return out
@@ -412,11 +346,28 @@ def _fix_clause(profile: dict | None) -> str:
     magnet = " (bug magnet)" if profile.get("bug_magnet") else ""
     return (
         f"{n} bug fix{'es' if n != 1 else ''} in 6mo, "
-        f"last {profile['last_fix_days_ago']}d ago{magnet}, "
+        f"last {profile['last_fix_days_ago']}d before the indexed commit{magnet}, "
     )
 
 
-def _defect_profile(meta: Any) -> dict | None:
+def _churn_clause(churn_percentile: float, is_hotspot: bool, trend: str) -> str:
+    """Churn clause for ``risk_summary``, or empty when the file is not a hotspot.
+
+    ``churn_percentile`` is a rank (0 to 1), not a risk. Printed as a bare
+    percentage it read like "100% risk", and it was printed for files below the
+    hotspot cut too. So the clause states the rank as a rank ("top N%") and only
+    for files the stored ``is_hotspot`` flag marks; ``trend`` stays available as
+    its own field either way. Trailing separator included, as in ``_fix_clause``.
+    """
+    if not is_hotspot:
+        return ""
+    # Round before the ceiling: 1 - 0.86 is 0.14000000000000001 in floats, and
+    # that would otherwise print as top 15%.
+    top_pct = max(1, math.ceil(round((1.0 - churn_percentile) * 100, 6)))
+    return f"churn hotspot, top {top_pct}% ({trend}), "
+
+
+def _defect_profile(meta: Any, now: datetime | None = None) -> dict | None:
     """What this file's counted bug fixes say about it, or ``None`` for silence.
 
     Built from the fix-event rollup already loaded on the ``GitMetadata`` row,
@@ -433,7 +384,7 @@ def _defect_profile(meta: Any) -> dict | None:
     string repeated once per target is exactly the per-file cost the lean-MCP
     work went to some trouble to remove.
     """
-    profile = fix_annotation(meta)
+    profile = fix_annotation(meta, now=now)
     if profile is None:
         return None
     profile["window"] = "6 months"
@@ -472,7 +423,9 @@ def _load_commit_categories(meta: Any) -> dict:
     return categories
 
 
-def _unresolved_reason(target: str, lookup_path: str, repo_root: str | None) -> str:
+async def _unresolved_reason(
+    target: str, lookup_path: str, repo_root: str | None
+) -> dict[str, Any]:
     """Why *target* names nothing this tool can score, in the caller's terms.
 
     ``not_indexed`` and ``no_such_path`` are spelled as
@@ -480,18 +433,64 @@ def _unresolved_reason(target: str, lookup_path: str, repo_root: str | None) -> 
     borrowed: ``get_health``'s ``no_such_module`` means "no module of that
     name", and it resolves a directory to ``not_indexed`` — both would
     prescribe a fix that cannot help here.
+
+    ``no_such_path`` also carries what :func:`missing_path_hint` finds (a
+    rename, or another branch holding the path), off the thread so the
+    blocking git calls do not stall the loop.
     """
     if target.startswith("module:"):
-        return "unsupported_target_kind"
+        return {"unresolved_reason": "unsupported_target_kind"}
     try:
         on_disk = Path(repo_root) / lookup_path if repo_root else Path(lookup_path)
         if on_disk.is_dir():
-            return "directory"
+            return {"unresolved_reason": "directory"}
         if on_disk.exists():
-            return "not_indexed"
+            return {"unresolved_reason": "not_indexed"}
     except (OSError, ValueError):
         pass
-    return "no_such_path"
+    hint = await asyncio.to_thread(missing_path_hint, repo_root, lookup_path)
+    return {"unresolved_reason": "no_such_path", **hint}
+
+
+def _history_tier_card(target: str, meta: Any, security_signals: list[dict]) -> dict:
+    """The card for a file indexed at the history tier (``meta.history_only``).
+
+    A non-code file keeps commit counts, windows and authorship, but no churn
+    percentile, hotspot flag, co-change partners or fix rollup, so the scored
+    card would print zeros nothing measured. This one carries only what was.
+    """
+    commits = meta.commit_count_total or 0
+    last = meta.last_commit_at.isoformat() if meta.last_commit_at else None
+    owner = meta.primary_owner_name or "unknown"
+    pct = meta.primary_owner_commit_pct or 0.0
+    return {
+        "target": target,
+        "signal_tier": "history",
+        "signal_tier_reason": (
+            "not a parsed code file: only commit history is indexed, so hotspot, "
+            "co-change and risk classification do not apply"
+        ),
+        "commit_count_total": commits,
+        "commit_count_90d": meta.commit_count_90d or 0,
+        "last_commit_at": last,
+        "trend": _compute_trend(meta),
+        "primary_owner": owner,
+        "owner_pct": pct,
+        "contributor_count": meta.contributor_count or 0,
+        "security_signals": security_signals,
+        # Workspace enrichment adds its rows here; co-change covers code files only.
+        "relationship_analysis": {
+            "co_change": {
+                "status": "unavailable",
+                "scope": "git_history",
+                "reason": "history-tier file",
+            }
+        },
+        "risk_summary": (
+            f"{target}: history only, {commits} commits, last {last[:10] if last else 'unknown'}, "
+            f"{_owner_clause(owner, pct, None)}"
+        ),
+    }
 
 
 async def _assess_one_target(
@@ -506,6 +505,8 @@ async def _assess_one_target(
     team_size: int | None = None,
     collector: OmissionCollector | None = None,
     include_graph: bool = False,
+    as_of_ts: datetime | None = None,
+    repo_root: str | None = None,
 ) -> dict:
     """Assess risk for a single target file.
 
@@ -516,7 +517,8 @@ async def _assess_one_target(
     repo_id = repository.id
     result_data: dict[str, Any] = {"target": target}
 
-    lookup_path = normalize_target_path(target, repo_root=repository.local_path)
+    repo_root = served_root(repository, repo_root)
+    lookup_path = normalize_target_path(target, repo_root=repo_root)
     dependency_population = _dependency_population(
         lookup_path, reverse_deps, node_meta, exclude_spec
     )
@@ -639,11 +641,15 @@ async def _assess_one_target(
         return {
             "target": target,
             "resolved": False,
-            "unresolved_reason": _unresolved_reason(target, lookup_path, repository.local_path),
+            **await _unresolved_reason(target, lookup_path, repo_root),
             "risk_summary": (
                 f"{target} — not resolved to an indexed file; no risk signal was computed"
             ),
         }
+
+    if getattr(meta, "history_only", False) is True:
+        security = await _get_security_signals(session, repo_id, lookup_path)
+        return _history_tier_card(target, meta, security)
 
     if meta is None:
         result_data["hotspot_score"] = 0.0
@@ -737,7 +743,7 @@ async def _assess_one_target(
     if merge_commit_count > 0:
         result_data["merge_commit_count_90d"] = merge_commit_count
 
-    defect_profile = _defect_profile(meta)
+    defect_profile = _defect_profile(meta, now=as_of_ts)
     if defect_profile is not None:
         result_data["defect_profile"] = defect_profile
 
@@ -757,10 +763,10 @@ async def _assess_one_target(
     # on a churn percentile even where risk_type said "bug-prone", so the first
     # thing an agent read disagreed with the classification beside it. Counted
     # fixes are the better grounded defect signal, so they go first and churn
-    # keeps its place as the next clause.
+    # keeps its place as the next clause, for files that are churn hotspots.
     result_data["risk_summary"] = (
         f"{target} — {_fix_clause(defect_profile)}"
-        f"hotspot score {hotspot_score:.0%} ({trend}), "
+        f"{_churn_clause(hotspot_score, result_data['is_hotspot'], trend)}"
         f"{dep_count} direct dependents, {risk_type}, {change_pattern}, "
         f"{co_changes_total} co-change partners, {_owner_clause(owner, pct, line_pct)}"
         f"{bus_note}{capped_note}"
